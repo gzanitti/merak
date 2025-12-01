@@ -1,0 +1,13 @@
+[package]
+name = "merak"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+merak-parser.workspace = true
+merak-errors.workspace = true
+merak-ast.workspace = true
+merak-analyzer.workspace = true
+merak-ir.workspace = true
+indexmap.workspace = true

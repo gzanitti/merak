@@ -1,0 +1,41 @@
+import AuxFunc from auxfunc;
+import AuxVar from auxvar as AuxGlobal;
+
+contract SimpleVault[Open, Closed] {
+    state var balance: {int | balance >= 0} = 0; // variable global guardada en el state de ethereum
+    state const maxBalance: int = 1000; // constante global guardada en el state de ethereum
+
+    // Constructor que se llama por unica vez al deployar el contrato 
+    constructor(owner: address) {
+        balance = 0;
+    }
+}
+
+// Merak usa un paradigma de maquina de estado, donde en la definicion del contrato
+// se establecen los posibles estados que este puede tener y luego, para cada estado
+// se definen las funciones que pueden ser llamadas. Las transiciones entre un estado a otro
+// se realizan haciendo uso de la palabra reservada ´become´ mas el nombre al estado al que se transiciona
+SimpleVault@Open(any) {
+    entrypoint deposit(amount: {int | amount > 0 && amount <= 100}) {
+        balance = balance + amount;
+        if (balance >= maxBalance) {
+            become Closed;
+        }
+    }
+
+    external function balance() -> {int | balance >= 0} {
+        return balance;
+    }
+
+    internal function sum(x: int, y: int) -> int {
+        var z: int = x + y;
+        return z;
+    }
+}
+
+SimpleVault@Closed(any) {
+    entrypoint reset() {
+        balance = 0;
+        become Open;
+    }
+}

@@ -1,0 +1,27 @@
+[workspace]
+resolver = "2"
+members = [
+    "merak",
+    "ast", "errors",
+    "ir", #"opt",
+    "parser", "merak-cli",
+    "analyzer", "symbols"
+    ]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+merak = { path = "./merak" }
+merak-cli = { path = "./merak-cli" }
+merak-ast = { path = "./ast" }
+merak-parser = { path = "./parser" }
+merak-ir = { path = "./ir" }
+merak-errors = { path = "./errors" }
+#merak-opt = { path = "./opt" }
+merak-analyzer = { path = "./analyzer" }
+merak-symbols = { path = "./symbols" }
+
+indexmap = "2.0"

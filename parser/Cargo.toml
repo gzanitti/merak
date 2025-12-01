@@ -1,0 +1,20 @@
+[package]
+name = "merak-parser"
+build = "build.rs"
+description = "merak parser"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+merak-ast.workspace = true
+merak-errors.workspace = true
+lalrpop-util = {version = "0.22.2", features = ["lexer", "unicode"]}
+primitive-types = "0.13.1"
+hex = "0.4.3"
+
+[dev-dependencies]
+
+[build-dependencies]
+lalrpop = "0.22.2"
+

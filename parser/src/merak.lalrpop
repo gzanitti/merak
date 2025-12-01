@@ -1,0 +1,735 @@
+use std::str::FromStr;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use merak_ast::{contract::*, statement::*, function::*, expression::*, types::*, meta::*, NodeIdGenerator, predicate::*};
+use crate::helpers::{ensure_return_statement, parse_hexa_h256, StateItem, LoopProperty};
+
+grammar(id_gen: &NodeIdGenerator);
+
+// Tokens básicos
+match {
+    // Whitespace y comentarios (ignorados)
+    r"\s*" => { },
+    r"//[^\n\r]*[\n\r]*" => { },
+    r"/\*[^*]*\*+(?:[^/*][^*]*\*+)*/" => { },
+    
+    // Keywords
+    "contract",
+    "state",
+    "var",
+    "const",
+    "constructor",
+    "function",
+    "internal",
+    "external",
+    "entrypoint",
+    "payable",
+    "guarded",
+    "reentrant",
+    "if",
+    "else",
+    "while",
+    "with",
+    "@invariant",
+    "@variant",
+    "return",
+    "become",
+    "any",
+    "true",
+    "false",
+    "int",
+    "address",
+    "bool",
+    "string",
+    "requires",
+    "ensures",
+    "import",
+    "from",
+    "as",
+    "Global",
+    "msg.sender",
+    "msg.value",
+    "block.timestamp",
+    "old",
+
+    // Operators
+    "||",
+    "&&",
+    "==",
+    "!=",
+    "<=",
+    ">=",
+    "<",
+    ">",
+    "+",
+    "-",
+    "*",
+    "/",
+    "%",
+    "!",
+    "=",
+    "->",
+    "@",
+    "|",
+    "iff",
+    
+    // Delimiters
+    "(",
+    ")",
+    "{",
+    "}",
+    "[",
+    "]",
+    ",",
+    ";",
+    ":",
+    
+    // Literals
+    r"0x[0-9a-fA-F]+" => HEX_TOKEN,
+    //r"[0-9]+\.[0-9]*" => DECIMAL,
+    r"[0-9]+" => INTEGER,
+    r#""([^"]|"")*""# => STRING,
+    r"\.\.?/[a-zA-Z0-9_/]+" => RELATIVE_PATH,
+    r"[a-zA-Z][a-zA-Z0-9_]*" => IDENT,
+}
+
+pub Program: Contract = {
+    <imports:Import*> <data:ContractInit> <state_defs:StateSpecificContract*> => {
+        Contract {
+            imports,
+            data,
+            state_defs,
+        }
+    }
+};
+
+// Import statements
+// Examples:
+// - import SimpleVault from simple_vault;
+// - import Math from ./lib/math;
+// - import SimpleVault from simple_vault as Vault;
+Import: Import = {
+    // Import without alias: import ContractName from path;
+    <start:@L> "import" <contract_name:Ident> "from" <file_path:ImportPath> ";" <end:@R> => {
+        Import {
+            contract_name,
+            file_path,
+            alias: None,
+            source_ref: SourceRef::new(start, end),
+        }
+    },
+    // Import with alias: import ContractName from path as Alias;
+    <start:@L> "import" <contract_name:Ident> "from" <file_path:ImportPath> "as" <alias:Ident> ";" <end:@R> => {
+        Import {
+            contract_name,
+            file_path,
+            alias: Some(alias),
+            source_ref: SourceRef::new(start, end),
+        }
+    },
+};
+
+// Import path: can be a bare identifier (simple_vault) or a relative path (./lib/math)
+ImportPath: PathBuf = {
+    // Bare module name: simple_vault
+    <id:Ident> => PathBuf::from(id),
+    // Relative path: ./lib/math, ../other/module
+    <path:RelativePath> => PathBuf::from(path),
+};
+
+// Relative path pattern: ./<path> or ../<path>
+RelativePath: String = {
+    <s:RELATIVE_PATH> => s.to_string(),
+};
+
+ContractInit: ContractInit = {
+    <start:@L> "contract" <name:Ident> "[" <states:States?> "]" "{"
+    <declarations:StateItem*>
+    <constructor:Constructor?> "}" <end:@R> => {
+        let mut variables = Vec::new();
+        let mut constants = Vec::new();
+        for decl in declarations {
+            match decl {
+                StateItem::Var(v) => variables.push(v),
+                StateItem::Const(c) => constants.push(c),
+            }
+        }
+        ContractInit { name, states: states.unwrap_or_default(), variables, constants, constructor }
+    }
+};
+
+StateItem: StateItem = {
+    <v:StateVar> => StateItem::Var(v),
+    <c:StateConst> => StateItem::Const(c),
+};
+
+States: Vec<String> = {
+    <first:Ident> <rest:("," <Ident>)*> => {
+        let mut states = vec![first];
+        states.extend(rest);
+        states
+    }
+};
+
+StateVar: StateVar = {
+    <start:@L> "state" "var" <name:Ident> ":" <ty:TypeWithNamedBinder> "=" <expr:Expression> ";" <end:@R> => {
+        let mut updated_ty = ty;
+        if updated_ty.binder == "_self" {
+            updated_ty.binder = name.clone();
+        }
+        StateVar { name, ty: updated_ty, expr, id: id_gen.next(), source_ref: SourceRef::new(start, end) }
+    }
+};
+
+StateConst: StateConst = {
+    <start:@L> "state" "const" <name:Ident> ":" <ty:TypeWithNamedBinder> "=" <expr:Expression> ";" <end:@R> => {
+        let mut updated_ty = ty;
+        if updated_ty.binder == "_self" {
+            updated_ty.binder = name.clone();
+        }
+        StateConst { name, ty: updated_ty, expr, id: id_gen.next(), source_ref: SourceRef::new(start, end) }
+    }
+};
+
+Constructor: Constructor = {
+    <start:@L> "constructor" "(" <params:ParamList?> ")" "{" <body:Block> "}" <end:@R> => {
+        Constructor {
+            params: params.unwrap_or_default(),
+            body: body.into(),
+            id: id_gen.next(),
+            source_ref: SourceRef::new(start, end),
+        }
+    }
+};
+
+StateSpecificContract: (String, StateDef) = {
+    <start:@L> <contract:Ident> "@" <name:StateNameOrGlobal> "(" <owner:StateOwner> ")" "{" <functions:Function*> "}" <end:@R> => {
+        let state_def = StateDef {
+            contract,
+            name: name.clone(),
+            owner,
+            functions,
+            source_ref: SourceRef::new(start, end),
+        };
+        (name, state_def)
+    }
+};
+
+StateNameOrGlobal: String = {
+    "Global" => "Global".to_string(),  
+    <Ident> => <>,                     
+};
+
+StateOwner: Owner = {
+    <Ident> => Owner::Ident(<>),
+    <Address> => Owner::Address(<>),
+    "any" => Owner::Any,
+};
+
+Function: Function = {
+    <start:@L> <visibility:FnVisibility> <name:Ident>  "(" <params:ParamList?> ")" <modifiers: FnModifier*>
+    <requires:("requires" "(" <RequiresList> ")")*>
+    <ensures:("ensures" "(" <RequiresList> ")")*>
+    <return_type:("->" <TypeWithNamedBinder>)?>
+    "{" <body:Block> "}" <end:@R> => {
+        let function = Function {
+            payable: modifiers.contains(&Modifier::Payable),
+            visibility,
+            modifiers: modifiers.into_iter().filter(|m| m != &Modifier::Payable).collect(),
+            name,
+            params: params.unwrap_or_default(),
+            return_type,
+            requires: requires.into_iter().flatten().collect(),
+            ensures: ensures.into_iter().flatten().collect(),
+            body: body.into(),
+            id: id_gen.next(),
+            source_ref: SourceRef::new(start, end)
+        };
+        ensure_return_statement(function)
+    }
+};
+
+RequiresList: Vec<Predicate> = {
+    <first:Predicate> <rest:("," <Predicate>)*> => {
+        let mut requires = vec![first];
+        requires.extend(rest);
+        requires
+    }
+};
+
+FnVisibility: Visibility = {
+    "internal" "function" => Visibility::Internal,
+    "external" "function" => Visibility::External,
+    "entrypoint" => Visibility::Entrypoint,
+};
+
+FnModifier: Modifier = {
+    "payable" => Modifier::Payable,
+    "guarded" => Modifier::Guarded,
+    "reentrant" => Modifier::Reentrant,
+};
+
+Param: Param = {
+    <start:@L> <name:Ident> ":" <ty: TypeWithNamedBinder> <end:@R> => {
+        let mut updated_ty = ty;
+        if updated_ty.binder == "_self" {
+            updated_ty.binder = name.clone();
+        }
+        Param { name, ty: updated_ty, id: id_gen.next(), source_ref: SourceRef::new(start, end) }
+    }
+};
+
+ParamList: Vec<Param> = {
+    <first:Param> <rest:("," <Param>)*> => {
+        let mut params = vec![first];
+        params.extend(rest);
+        params
+    }
+};
+
+TypeWithNamedBinder: Type = {
+    <start:@L>"{" <explicit_binder:Ident>":"<base_type:BaseType> "|" <constraint:Predicate> "}" <end:@R> => {
+        Type { base: base_type, binder: explicit_binder, constraint, source_ref: SourceRef::new(start, end) }
+    },
+    <start:@L>"{" <base_type:BaseType> "|" <constraint:Predicate> "}" <end:@R> => {
+        Type { base: base_type, binder: "_self".to_string(), constraint, source_ref: SourceRef::new(start, end) }
+    },
+    <start:@L><base_type:BaseType><end:@R> => {
+        Type { base: base_type, binder: "_self".to_string(), constraint: Predicate::True(id_gen.next(), SourceRef::new(start, end)), source_ref: SourceRef::new(start, end) }
+    },
+};
+
+
+// TODO: Decimal
+BaseType: BaseType = {
+    "int" => BaseType::Int,
+    "address" => BaseType::Address,
+    "bool" => BaseType::Bool,
+    "string" => BaseType::String,
+};
+
+// Statements
+Block: Vec<Statement> = {
+    <Statement*>
+};
+
+Statement: Statement = {
+    <start:@L> <expr:Expression> ";" <end:@R> => Statement::Expression(expr, id_gen.next(), SourceRef::new(start, end)),
+    <start:@L>"if" "(" <condition:Expression> ")" "{" <then:Block> "}" <_else:("else" "{" <Block> "}")?> <end:@R> => {
+        Statement::If { condition, then_block: then.into(), else_block: _else.map(|block| block.into()), id: id_gen.next(), source_ref: SourceRef::new(start, end) }
+    },
+    <start:@L>"while" "(" <condition:Expression> ")" <props:LoopProperties> "{" <body:Block> "}" <end:@R>=> {
+        let (invariants, variants) = props;
+        Statement::While {
+            condition,
+            invariants,
+            variants,
+            body: body.into(),
+            id: id_gen.next(),
+            source_ref: SourceRef::new(start, end)
+        }
+    },
+    <start:@L>"return" <expr:Expression?> ";"<end:@R> => Statement::Return(expr, id_gen.next(), SourceRef::new(start, end)),
+
+    <start:@L><target:Ident> "=" <expr:Expression> ";"<end:@R>=> Statement::Assignment { target, expr, id: id_gen.next(), source_ref: SourceRef::new(start, end) },
+
+    <start:@L>"var" <name:Ident> <ty:(":" <TypeWithNamedBinder>)?> "=" <expr:Expression> ";"<end:@R> => {
+        let updated_ty = match ty {
+            Some(mut t) => {
+                if t.binder == "_self" {
+                    t.binder = name.clone();
+                }
+                Some(t)
+            },
+            None => None  
+        };
+        Statement::VarDeclaration { 
+            name, 
+            ty: updated_ty, 
+            expr, 
+            id: id_gen.next(), 
+            source_ref: SourceRef::new(start, end) 
+        }
+    },
+    
+    // Const local - tipo OPCIONAL
+    <start:@L>"const" <name:Ident> <ty:(":" <TypeWithNamedBinder>)?> "=" <expr:Expression> ";"<end:@R> => {
+        let updated_ty = match ty {
+            Some(mut t) => {
+                if t.binder == "_self" {
+                    t.binder = name.clone();
+                }
+                Some(t)
+            },
+            None => None  
+        };
+        Statement::ConstDeclaration { 
+            name, 
+            ty: updated_ty,  
+            expr, 
+            id: id_gen.next(), 
+            source_ref: SourceRef::new(start, end) 
+        }
+    },
+    <start:@L>"become" <state:Ident> ";"<end:@R> => Statement::Become(state, id_gen.next(), SourceRef::new(start, end)),
+};
+
+LoopProperties: (Vec<Predicate>, Vec<RefinementExpr>) = "with" <props:PropertiesList> => {
+    let mut invariants = Vec::new();
+    let mut variants = Vec::new();
+
+    for prop in props {
+        match prop {
+            LoopProperty::Invariant(pred) => invariants.push(pred),
+            LoopProperty::Variant(expr) => variants.push(expr),
+        }
+    }
+
+    (invariants, variants)
+};
+
+PropertiesList: Vec<LoopProperty> = {
+    <inv:Invariant> <middle:LoopProperty*> <var:Variant> => {
+        let mut props = vec![inv];
+        props.extend(middle);
+        props.push(var);
+        props
+    },
+    <var:Variant> <middle:LoopProperty*> <inv:Invariant> => {
+        let mut props = vec![var];
+        props.extend(middle);
+        props.push(inv);
+        props
+    }
+};
+
+LoopProperty: LoopProperty = {
+    <inv:Invariant> => inv,
+    <var:Variant> => var
+};
+
+Invariant: LoopProperty = "@invariant" "(" <pred:Predicate> ")" => LoopProperty::Invariant(pred);
+Variant: LoopProperty = "@variant" "(" <expr:RefinementExpr> ")" => LoopProperty::Variant(expr);
+
+Expression: Expression = LogicalOr;
+
+LogicalOr: Expression = {
+    <start:@L><left:LogicalOr> "||" <right:LogicalAnd><end:@R> => {
+        Expression::BinaryOp { left: Box::new(left), op: BinaryOperator::LogicalOr, right: Box::new(right), id: id_gen.next(), source_ref: SourceRef::new(start, end) }
+    },
+    LogicalAnd,
+};
+
+LogicalAnd: Expression = {
+    <start:@L><left:LogicalAnd> "&&" <right:Equality><end:@R> => {
+        Expression::BinaryOp { left: Box::new(left), op: BinaryOperator::LogicalAnd, right: Box::new(right), id: id_gen.next(), source_ref: SourceRef::new(start, end) }
+    },
+    Equality,
+};
+
+Equality: Expression = {
+    <start:@L><left:Equality> <op:EqualityOp> <right:Comparison><end:@R> => {
+        Expression::BinaryOp { left: Box::new(left), op, right: Box::new(right), id: id_gen.next(), source_ref: SourceRef::new(start, end)}
+    },
+    Comparison,
+};
+
+EqualityOp: BinaryOperator = {
+    "==" => BinaryOperator::Equal,
+    "!=" => BinaryOperator::NotEqual,
+};
+
+Comparison: Expression = {
+    <start:@L><left:Comparison> <op:ComparisonOp> <right:Arithmetic><end:@R> => {
+        Expression::BinaryOp { left: Box::new(left), op, right: Box::new(right), id: id_gen.next(), source_ref: SourceRef::new(start, end)}
+    },
+    Arithmetic,
+};
+
+ComparisonOp: BinaryOperator = {
+    "<=" => BinaryOperator::LessEqual,
+    "<" => BinaryOperator::Less,
+    ">=" => BinaryOperator::GreaterEqual,
+    ">" => BinaryOperator::Greater,
+};
+
+Arithmetic: Expression = {
+    <start:@L><left:Arithmetic> <op:AddOp> <right:Term><end:@R> => {
+        Expression::BinaryOp { left: Box::new(left), op, right: Box::new(right), id: id_gen.next(), source_ref: SourceRef::new(start, end)}
+    },
+    Term,
+};
+
+AddOp: BinaryOperator = {
+    "+" => BinaryOperator::Add,
+    "-" => BinaryOperator::Subtract,
+};
+
+Term: Expression = {
+    <start:@L><left:Term> <op:MulOp> <right:Factor><end:@R> => {
+        Expression::BinaryOp { left: Box::new(left), op, right: Box::new(right), id: id_gen.next(), source_ref: SourceRef::new(start, end)}
+    },
+    Factor,
+};
+
+MulOp: BinaryOperator = {
+    "*" => BinaryOperator::Multiply,
+    "/" => BinaryOperator::Divide,
+    "%" => BinaryOperator::Modulo,
+};
+
+Factor: Expression = {
+    <start:@L><op:UnaryOp> <expr:Factor><end:@R> => {
+        Expression::UnaryOp { op, expr: Box::new(expr), id: id_gen.next(), source_ref: SourceRef::new(start, end) }
+    },
+    Primary,
+};
+
+UnaryOp: UnaryOperator = {
+    "-" => UnaryOperator::Negate,
+    "!" => UnaryOperator::Not,
+};
+
+Primary: Expression = {
+    <start:@L><lit:Literal><end:@R> => Expression::Literal(lit, id_gen.next(), SourceRef::new(start, end)),
+    <start:@L><name:Ident> "(" <args:FunctionArgs> ")"<end:@R> => {
+        Expression::FunctionCall {
+            name: name,
+            args: args,
+            id: id_gen.next(),
+            source_ref: SourceRef::new(start, end)
+        }
+    },
+    <start:@L><iden:Ident><end:@R> => Expression::Identifier(iden, id_gen.next(), SourceRef::new(start, end)),
+    "(" <Expression> ")",
+};
+
+FunctionArgs: Vec<Expression> = {
+    <first:Expression> <rest:("," <Expression>)*> => {
+        let mut v = vec![first];
+        v.extend(rest);
+        v
+    },
+    => vec![]
+};
+
+// Literals
+Literal: Literal = {
+    <Integer> => Literal::Integer(<>),
+    //<Decimal> => Literal::Decimal(<>),
+    <String> => Literal::String(<>),
+    <address:Address> => Literal::Address(parse_hexa_h256(&address).unwrap()),
+    <Boolean> => Literal::Boolean(<>),
+};
+
+
+// ============================================================================
+// PREDICATES: Para refinamientos de tipos
+// ============================================================================
+
+pub Predicate: Predicate = LogicalOrPred;
+
+LogicalOrPred: Predicate = {
+    <start:@L><left:LogicalOrPred> "||" <right:LogicalAndPred><end:@R> => {
+        Predicate::Or(Box::new(left), Box::new(right), id_gen.next(), SourceRef::new(start, end))
+    },
+    LogicalAndPred,
+};
+
+LogicalAndPred: Predicate = {
+    <start:@L><left:LogicalAndPred> "&&" <right:ComparisonPred><end:@R> => {
+        Predicate::And(Box::new(left), Box::new(right), id_gen.next(), SourceRef::new(start, end))
+    },
+    ComparisonPred,
+};
+ComparisonPred: Predicate = {
+    <start:@L><lhs:RefinementExpr> <suffix:ComparisonSuffix?><end:@R> => {
+        match suffix {
+            Some((op, rhs)) => Predicate::BinRel {
+                op,
+                lhs,
+                rhs,
+                id: id_gen.next(),
+                source_ref: SourceRef::new(start, end),
+            },
+            // Caso 2: No hay operador, debe ser una variable booleana solitaria (ej: is_valid)
+            None => {
+                match lhs {
+                    // Convertimos la variable de refinamiento a variable de predicado
+                    RefinementExpr::Var(id, node_id, sr) => Predicate::Var(id, node_id, sr),
+                    RefinementExpr::UninterpFn { name, args, id, source_ref } => Predicate::UninterpFnCall{name, args, id, source_ref},
+
+                    // Cualquier otra cosa (ej: "5", "x + 1") no es un predicado válido por sí mismo
+                    _ => panic!("Error de sintaxis: Se esperaba una comparación o una variable booleana, se encontró una expresión aritmética."),
+                }
+            }
+        }
+    },
+    PredicatePrimary
+};
+
+ComparisonSuffix: (RelOp, RefinementExpr) = {
+    <op:ComparisonOpPred> <rhs:RefinementExpr> => (op, rhs)
+};
+
+ComparisonOpPred: RelOp = {
+    "==" => RelOp::Eq,
+    "!=" => RelOp::Neq,
+    "<" => RelOp::Lt,
+    "<=" => RelOp::Leq,
+    ">" => RelOp::Gt,
+    ">=" => RelOp::Geq,
+};
+
+PredicatePrimary: Predicate = {
+    <start:@L>"true"<end:@R> => Predicate::True(id_gen.next(), SourceRef::new(start, end)),
+    <start:@L>"false"<end:@R> => Predicate::False(id_gen.next(), SourceRef::new(start, end)),
+    <start:@L>"!" <pred:PredicatePrimary><end:@R> => Predicate::Not(Box::new(pred), id_gen.next(), SourceRef::new(start, end)),
+    "(" <Predicate> ")",
+};
+
+// ============================================================================
+// REFINEMENT EXPRESSIONS: Expresiones dentro de predicados y variantes
+// ============================================================================
+
+pub RefinementExpr: RefinementExpr = RefinementArith;
+
+RefinementArith: RefinementExpr = {
+    <start:@L><left:RefinementArith> "+" <right:RefinementTerm><end:@R> => {
+        RefinementExpr::BinOp {
+            op: ArithOp::Add,
+            lhs: Box::new(left),
+            rhs: Box::new(right),
+            id: id_gen.next(),
+            source_ref: SourceRef::new(start, end),
+        }
+    },
+    <start:@L><left:RefinementArith> "-" <right:RefinementTerm><end:@R> => {
+        RefinementExpr::BinOp {
+            op: ArithOp::Sub,
+            lhs: Box::new(left),
+            rhs: Box::new(right),
+            id: id_gen.next(),
+            source_ref: SourceRef::new(start, end),
+        }
+    },
+    RefinementTerm,
+};
+
+RefinementTerm: RefinementExpr = {
+    <start:@L><left:RefinementTerm> "*" <right:RefinementFactor><end:@R> => {
+        RefinementExpr::BinOp {
+            op: ArithOp::Mul,
+            lhs: Box::new(left),
+            rhs: Box::new(right),
+            id: id_gen.next(),
+            source_ref: SourceRef::new(start, end),
+        }
+    },
+    <start:@L><left:RefinementTerm> "/" <right:RefinementFactor><end:@R> => {
+        RefinementExpr::BinOp {
+            op: ArithOp::Div,
+            lhs: Box::new(left),
+            rhs: Box::new(right),
+            id: id_gen.next(),
+            source_ref: SourceRef::new(start, end),
+        }
+    },
+    <start:@L><left:RefinementTerm> "%" <right:RefinementFactor><end:@R> => {
+        RefinementExpr::BinOp {
+            op: ArithOp::Mod,
+            lhs: Box::new(left),
+            rhs: Box::new(right),
+            id: id_gen.next(),
+            source_ref: SourceRef::new(start, end),
+        }
+    },
+    RefinementFactor,
+};
+
+RefinementFactor: RefinementExpr = {
+    // Negación unaria
+    <start:@L>"-" <expr:RefinementFactor><end:@R> => {
+        RefinementExpr::UnaryOp {
+            op: UnaryOp::Negate,
+            expr: Box::new(expr),
+            id: id_gen.next(),
+            source_ref: SourceRef::new(start, end),
+        }
+    },
+    RefinementPrimary,
+};
+
+RefinementPrimary: RefinementExpr = {
+    // Función no interpretada
+    // Ejemplos: len(arr), owner(contract), balance_of(addr)
+    <start:@L><name:Ident> "(" <args:RefinementArgs> ")"<end:@R> => {
+        RefinementExpr::UninterpFn {
+            name,
+            args,
+            id: id_gen.next(),
+            source_ref: SourceRef::new(start, end),
+        }
+    },
+
+    <start:@L>"old" "(" <expr:RefinementExpr> ")"<end:@R> => {
+        RefinementExpr::Old {
+            expr: Box::new(expr),
+            id: id_gen.next(),
+            source_ref: SourceRef::new(start, end),
+        }
+    },
+
+    <start:@L><id:Ident><end:@R> => RefinementExpr::Var(id, id_gen.next(), SourceRef::new(start, end)),
+
+    <start:@L><n:Integer><end:@R> => RefinementExpr::IntLit(n, id_gen.next(), SourceRef::new(start, end)),
+
+    <start:@L><addr:Address><end:@R> => RefinementExpr::AddressLit(addr, id_gen.next(), SourceRef::new(start, end)),
+
+    // msg.sender, block.timestamp, etc.
+    <start:@L>"msg.sender"<end:@R> => RefinementExpr::MsgSender(id_gen.next(), SourceRef::new(start, end)),
+    <start:@L>"msg.value"<end:@R> => RefinementExpr::MsgValue(id_gen.next(), SourceRef::new(start, end)),
+    <start:@L>"block.timestamp"<end:@R> => RefinementExpr::BlockTimestamp(id_gen.next(), SourceRef::new(start, end)),
+};
+
+RefinementArgs: Vec<RefinementExpr> = {
+    <first:RefinementExpr> <rest:("," <RefinementExpr>)*> => {
+        let mut args = vec![first];
+        args.extend(rest);
+        args
+    },
+    => vec![],
+};
+
+Integer: i64 = {
+    INTEGER => i64::from_str(<>).unwrap(),
+};
+
+//Decimal: f64 = {
+//    DECIMAL => f64::from_str(<>).unwrap()
+//};
+
+String: String = {
+    STRING => {
+        let s = <>.to_string();
+        // Remove the surrounding quotes
+        if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+            s[1..s.len()-1].to_string()
+        } else {
+            s
+        }
+    }
+};
+
+Address: String = {
+    HEX_TOKEN => <>.to_string()
+};
+
+Boolean: bool = {
+    "true" => true,
+    "false" => false,
+};
+
+Ident: String = {
+    IDENT => <>.to_string()
+};

@@ -1,0 +1,14 @@
+[package]
+name = "merak-ir"
+description = "merak intermediate representations"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+merak-ast.workspace = true
+merak-parser.workspace = true
+merak-errors.workspace = true
+merak-symbols.workspace = true
+primitive-types = "0.13.1"
+indexmap = "2.0"

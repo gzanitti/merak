@@ -1,0 +1,16 @@
+// Test file para verificar conflicto entre guarded y reentrant
+
+contract TestConflict[Active] {
+    state var balance: int = 0;
+
+    constructor() {
+        balance = 0;
+    }
+}
+
+TestConflict@Active(any) {
+    // Test inválido: función con guarded y reentrant - debe fallar
+    external function conflictingFunction() guarded reentrant {
+        balance = balance + 1;
+    }
+}

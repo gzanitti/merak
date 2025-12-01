@@ -1,0 +1,16 @@
+// Test file para verificar validaciones de modificadores inválidos
+
+contract TestInvalid[Active] {
+    state var balance: int = 0;
+
+    constructor() {
+        balance = 0;
+    }
+}
+
+TestInvalid@Active(any) {
+    // Test inválido: internal function con guarded - debe fallar
+    internal function badInternal() guarded {
+        balance = balance + 1;
+    }
+}

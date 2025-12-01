@@ -1,0 +1,10 @@
+[package]
+name = "merak-symbols"
+description = "merak symbol table and related types"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+merak-ast.workspace = true
+merak-errors.workspace = true

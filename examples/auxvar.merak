@@ -1,0 +1,7 @@
+contract AuxVar[] {
+    // Expose a global variable to be imported and used
+    state var global_var: int = 42;
+
+    constructor() {}
+}
+

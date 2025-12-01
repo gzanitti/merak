@@ -1,0 +1,11 @@
+[package]
+name = "merak-ast"
+description = "merak ast"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+z3 = "0.13.3"
+primitive-types = "0.13.1" 
+indexmap.workspace = true 

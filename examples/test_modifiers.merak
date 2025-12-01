@@ -1,0 +1,36 @@
+// Test file para validar los nuevos modificadores
+
+contract TestModifiers[Active] {
+    state var balance: int = 0;
+
+    constructor() {
+        balance = 0;
+    }
+}
+
+TestModifiers@Active(any) {
+    // Test 1: external function con payable - válido
+    external function deposit() payable {
+        balance = balance + 100;
+    }
+
+    // Test 2: external function con guarded - válido
+    external function withdraw() guarded {
+        balance = balance - 50;
+    }
+
+    // Test 3: external function con reentrant - válido
+    external function callback() reentrant {
+        balance = balance + 10;
+    }
+
+    // Test 4: internal function sin modificadores de reentrancia - válido
+    internal function helper() {
+        balance = balance + 1;
+    }
+
+    // Test 5: entrypoint con payable y guarded - válido
+    entrypoint complexOperation() payable guarded {
+        balance = 0;
+    }
+}
