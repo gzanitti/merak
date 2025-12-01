@@ -206,11 +206,11 @@ The `guarded` modifier tells Merak to perform reentrancy analysis. The compiler 
 
 ## Contributing
 
-Merak is an ambitious long-term project. While it's not ready for production use, I believe formal verification is essential for blockchain's future. If you'd like to support this work:
+Merak is an ambitious long-term project. While it's not ready for production use, I believe formal verification is essential for blockchain's future. At this time, we are not accepting pull requests, but you can support the project via donations:
 
-**Ethereum Donation Address**: `[YOUR_ETHEREUM_ADDRESS_HERE]`
+**Ethereum Donation Address**: `0x7ff4408bf503cdd3991771a18e8f8c364eace215`
 
-Contributions will go toward:
+Donations will go toward:
 - Development time and research
 - Security audits when approaching production readiness
 - Documentation and developer tooling
