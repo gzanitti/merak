@@ -1,6 +1,7 @@
 use merak_ast::contract::Param;
 use merak_ast::function::{Modifier, Visibility};
-use merak_ast::types::Type;
+use merak_ast::predicate::Predicate;
+use merak_ast::types::{BaseType, Type};
 use merak_ast::NodeId;
 use merak_errors::{MerakError, MerakResult};
 use std::collections::HashMap;
@@ -20,7 +21,7 @@ pub enum SymbolId {
 }
 
 impl SymbolId {
-    fn new(index: usize) -> Self {
+    pub fn new(index: usize) -> Self {
         SymbolId::Named(index)
     }
 
@@ -42,7 +43,7 @@ impl fmt::Display for SymbolId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SymbolId::Named(n) => write!(f, "{}", n),
-            SymbolId::Temp(n) => write!(f, "__tempid({})", n),
+            SymbolId::Temp(n) => write!(f, "__temp({})", n),
         }
     }
 }
@@ -57,18 +58,20 @@ pub enum SymbolNamespace {
 
 #[derive(Debug, Clone)]
 pub struct SymbolTable {
-    /// Arena: central storage for all SymbolInfo - single source of truth
+    /// Arena: central storage for all SymbolInfo
     symbol_arena: Vec<SymbolInfo>,
     /// Scope hierarchy for name resolution
     scopes: Vec<Scope>,
     current_scope: ScopeId,
     /// Maps NodeId -> SymbolId for O(1) lookup during type checking
     node_to_symbol: HashMap<NodeId, SymbolId>,
+    expr_to_type: HashMap<NodeId, BaseType>,
+    qualified_names_to_symbol: HashMap<String, SymbolId>,
 }
 
 #[derive(Debug, Clone)]
 pub struct Scope {
-    pub parent: Option<ScopeId>,
+    //pub parent: Option<ScopeId>,
     /// Maps (name, namespace) -> SymbolId (index into arena)
     pub symbols: HashMap<(String, SymbolNamespace), SymbolId>,
 }
@@ -76,7 +79,7 @@ pub struct Scope {
 impl SymbolTable {
     pub fn new() -> Self {
         let global_scope = Scope {
-            parent: None,
+            //parent: None,
             symbols: HashMap::new(),
         };
 
@@ -85,12 +88,14 @@ impl SymbolTable {
             scopes: vec![global_scope],
             current_scope: 0,
             node_to_symbol: HashMap::new(),
+            expr_to_type: HashMap::new(),
+            qualified_names_to_symbol: HashMap::new(),
         }
     }
 
     pub fn push_scope(&mut self) -> ScopeId {
         let new_scope = Scope {
-            parent: Some(self.current_scope),
+            //parent: Some(self.current_scope),
             symbols: HashMap::new(),
         };
 
@@ -101,25 +106,33 @@ impl SymbolTable {
     }
 
     pub fn pop_scope(&mut self) {
-        if let Some(parent) = self.scopes[self.current_scope].parent {
-            self.current_scope = parent;
-        }
+        // if let Some(parent) = self.scopes[self.current_scope].parent {
+        //     self.current_scope = parent;
+        // }
+        self.scopes.pop();
+        self.current_scope = self.current_scope - 1;
     }
 
-    /// Set the current scope to a specific scope ID
-    /// Used during name resolution to navigate to scopes created during symbol collection
-    pub fn set_current_scope(&mut self, scope_id: ScopeId) {
-        assert!(scope_id < self.scopes.len(), "Invalid scope ID");
-        self.current_scope = scope_id;
+    pub fn clean_scopes(&mut self) {
+        let global_scope = Scope {
+            symbols: HashMap::new(),
+        };
+
+        self.scopes.clear();
+        self.scopes = vec![global_scope];
+        self.current_scope = 0;
     }
 
-    /// Get the current scope ID
-    pub fn get_current_scope(&self) -> ScopeId {
-        self.current_scope
+    pub fn insert_expr_type(&mut self, node_id: NodeId, ty: BaseType) {
+        self.expr_to_type.insert(node_id, ty);
+    }
+
+    pub fn expr_to_type(&self, node_id: NodeId) -> Option<&BaseType> {
+        self.expr_to_type.get(&node_id)
     }
 
     /// Insert a symbol ID into the current scope
-    fn insert(&mut self, name: String, namespace: SymbolNamespace, symbol_id: SymbolId) {
+    pub fn insert(&mut self, name: String, namespace: SymbolNamespace, symbol_id: SymbolId) {
         self.scopes[self.current_scope]
             .symbols
             .insert((name, namespace), symbol_id);
@@ -127,19 +140,22 @@ impl SymbolTable {
 
     /// Lookup a symbol by name, returning its SymbolId if found
     pub fn lookup(&self, name: &str, namespace: SymbolNamespace) -> Option<SymbolId> {
-        let mut current = Some(self.current_scope);
+        let mut current = self.current_scope;
 
-        while let Some(scope_id) = current {
-            let scope = &self.scopes[scope_id];
+        loop {
+            let scope = &self.scopes[current];
 
             if let Some(&symbol_id) = scope.symbols.get(&(name.to_string(), namespace)) {
                 return Some(symbol_id);
             }
 
-            current = scope.parent;
+            current = match current.checked_sub(1) {
+                Some(parent) => parent,
+                None => {
+                    return self.qualified_names_to_symbol.get(name).cloned() 
+                }, 
+            };
         }
-
-        None
     }
 
     /// Get SymbolInfo from the arena by SymbolId - O(1) access
@@ -192,6 +208,7 @@ impl SymbolTable {
         // Add to arena and get its ID
         let symbol_id = SymbolId::new(self.symbol_arena.len());
         self.symbol_arena.push(info);
+        self.qualified_names_to_symbol.insert(qualified_name.to_string(), symbol_id);
 
         // Insert into scope tree
         self.insert(simple_name, namespace, symbol_id);
@@ -222,7 +239,6 @@ impl SymbolTable {
     }
 
     /// Get symbol information by NodeId - O(1) lookup for type checking
-    /// Returns reference to SymbolInfo from the arena
     pub fn get_symbol_by_node_id(&self, node_id: NodeId) -> Option<&SymbolInfo> {
         self.node_to_symbol
             .get(&node_id)
@@ -240,8 +256,6 @@ impl SymbolTable {
     }
 
     /// Update the type of a symbol identified by NodeId
-    /// Used during type checking when inferring types for declarations
-    /// Returns Ok(()) if the symbol was found and updated, Err if not found
     pub fn update_type(&mut self, node_id: NodeId, ty: Type) -> MerakResult<()> {
         let symbol_id =
             self.node_to_symbol
@@ -265,33 +279,6 @@ impl SymbolTable {
 // can use them in their integration tests.
 // ============================================================================
 impl SymbolTable {
-    /// Find all symbols with a given name across ALL scopes
-    /// Returns a vector of (ScopeId, SymbolId, &SymbolInfo) tuples
-    /// This allows tests to verify symbols exist in the correct scope with the correct properties
-    pub fn find_symbols_by_name(&self, name: &str) -> Vec<(ScopeId, SymbolId, &SymbolInfo)> {
-        let mut results = Vec::new();
-        for (scope_id, scope) in self.scopes.iter().enumerate() {
-            for ((symbol_name, _namespace), &symbol_id) in &scope.symbols {
-                if symbol_name == name {
-                    let info = self.get_symbol(symbol_id);
-                    results.push((scope_id, symbol_id, info));
-                }
-            }
-        }
-        results
-    }
-
-    /// Return the ScopeId where a symbol was defined
-    /// Useful for verifying symbols are registered in the expected scope
-    pub fn get_scope_for_symbol(&self, symbol_id: SymbolId) -> Option<ScopeId> {
-        for (scope_id, scope) in self.scopes.iter().enumerate() {
-            if scope.symbols.values().any(|&id| id == symbol_id) {
-                return Some(scope_id);
-            }
-        }
-        None
-    }
-
     /// Get all symbols in the symbol table
     /// Returns an iterator over (SymbolId, &SymbolInfo) pairs
     pub fn all_symbols(&self) -> impl Iterator<Item = (SymbolId, &SymbolInfo)> {
@@ -311,29 +298,33 @@ pub struct SymbolInfo {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SymbolKind {
-    Contract {
-        states: Vec<String>,
-    },
-    State {
+    Contract, 
+    ContractInit {
         contract: String,
     },
     StateVar,
     StateConst,
     Function {
-        state: String,
         visibility: Visibility,
         reentrancy: Modifier,
         parameters: Vec<Param>,
+        ensures: Vec<Predicate>,
+        requires: Vec<Predicate>,
         return_type: Type,
     },
     Entrypoint {
-        state: String,
         reentrancy: Modifier,
         parameters: Vec<Param>,
+        ensures: Vec<Predicate>,
+        requires: Vec<Predicate>,
         return_type: Type,
     },
-    Constructor {
-        contract: String,
+    Interface {
+        functions: Vec<SymbolId>,  
+    },
+    InterfaceFunction {     
+        params: Vec<Param>,       
+        return_type: Type,
     },
     Parameter,
     LocalVar,
@@ -344,14 +335,15 @@ impl SymbolKind {
     pub fn namespace(&self) -> SymbolNamespace {
         match self {
             SymbolKind::Contract { .. } => SymbolNamespace::Type,
-            SymbolKind::State { .. } => SymbolNamespace::Type,
+            SymbolKind::ContractInit { .. } => SymbolNamespace::Callable,
             SymbolKind::StateVar => SymbolNamespace::Value,
             SymbolKind::StateConst => SymbolNamespace::Value,
             SymbolKind::Function { .. } => SymbolNamespace::Callable,
             SymbolKind::Entrypoint { .. } => SymbolNamespace::Callable,
-            SymbolKind::Constructor { .. } => SymbolNamespace::Callable,
             SymbolKind::Parameter => SymbolNamespace::Value,
             SymbolKind::LocalVar => SymbolNamespace::Value,
+            SymbolKind::Interface { .. } => SymbolNamespace::Type,
+            SymbolKind::InterfaceFunction { .. } => SymbolNamespace::Callable
         }
     }
 }
@@ -359,38 +351,30 @@ impl SymbolKind {
 impl fmt::Display for SymbolKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SymbolKind::Contract { states } => {
-                if states.is_empty() {
-                    write!(f, "Contract[]")
-                } else {
-                    write!(f, "Contract[{}]", states.join(", "))
-                }
+            SymbolKind::Contract => {
+                    write!(f, "Contract")
             }
-            SymbolKind::State { contract } => write!(f, "State in contract '{}'", contract),
+            SymbolKind::ContractInit { contract } => write!(f, "ContractInit '{}'", contract),
             SymbolKind::StateVar => write!(f, "State variable"),
             SymbolKind::StateConst => write!(f, "State constant"),
             SymbolKind::Function {
-                state, return_type, ..
+                return_type, ..
             } => {
-                write!(f, "Function in state '{}'", state)?;
                 write!(f, "  return_type: {}", return_type)
             }
             SymbolKind::Entrypoint {
-                state, return_type, ..
+                return_type, ..
             } => {
-                write!(f, "Entrypoint in state '{}'", state)?;
                 write!(f, "  return_type: {}", return_type)
-            }
-            SymbolKind::Constructor { contract } => {
-                write!(f, "Constructor for contract '{}'", contract)
             }
             SymbolKind::Parameter => write!(f, "Parameter"),
             SymbolKind::LocalVar => write!(f, "Local variable"),
+            _ => unimplemented!("Don't be lazy"),
         }
     }
 }
 
-/// Represents a qualified name like `module::submodule::Contract`
+/// Represents a qualified name like `Contract::State::Function`
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct QualifiedName {
     pub parts: Vec<String>,
@@ -408,135 +392,14 @@ impl QualifiedName {
     pub fn to_string(&self) -> String {
         self.parts.join("::")
     }
+
+    pub fn last(&self) -> String {
+        self.parts.last().unwrap().clone()
+    }
 }
 
 impl fmt::Display for QualifiedName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.to_string())
-    }
-}
-
-impl fmt::Display for SymbolTable {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        writeln!(f, "Symbol Table")?;
-        writeln!(f, "============")?;
-        writeln!(f)?;
-
-        // Display all scopes recursively starting from global scope
-        self.fmt_scope(f, 0, 0)?;
-
-        writeln!(f)?;
-        writeln!(f, "Total symbols: {}", self.symbol_arena.len())?;
-        writeln!(f, "Total scopes: {}", self.scopes.len())?;
-        writeln!(f, "Current scope: {}", self.current_scope)?;
-
-        Ok(())
-    }
-}
-
-impl SymbolTable {
-    /// Helper function to format a scope and its children recursively
-    fn fmt_scope(
-        &self,
-        f: &mut fmt::Formatter<'_>,
-        scope_id: ScopeId,
-        indent: usize,
-    ) -> fmt::Result {
-        let indent_str = "  ".repeat(indent);
-        let scope = &self.scopes[scope_id];
-
-        writeln!(
-            f,
-            "{}Scope {} {}",
-            indent_str,
-            scope_id,
-            if scope_id == self.current_scope {
-                "(current)"
-            } else {
-                ""
-            }
-        )?;
-
-        // Group symbols by namespace
-        let mut value_symbols = Vec::new();
-        let mut callable_symbols = Vec::new();
-        let mut type_symbols = Vec::new();
-
-        for ((name, namespace), &symbol_id) in &scope.symbols {
-            match namespace {
-                SymbolNamespace::Value => value_symbols.push((name, symbol_id)),
-                SymbolNamespace::Callable => callable_symbols.push((name, symbol_id)),
-                SymbolNamespace::Type => type_symbols.push((name, symbol_id)),
-            }
-        }
-
-        // Display symbols by namespace
-        if !type_symbols.is_empty() {
-            writeln!(f, "{}  [Types]", indent_str)?;
-            for (name, symbol_id) in type_symbols {
-                let symbol = self.get_symbol(symbol_id);
-                writeln!(
-                    f,
-                    "{}    {} : {:?} = {:?}",
-                    indent_str,
-                    name,
-                    symbol.kind,
-                    symbol
-                        .ty
-                        .as_ref()
-                        .map(|t| format!("{}", t))
-                        .unwrap_or("?".to_string())
-                )?;
-            }
-        }
-
-        if !callable_symbols.is_empty() {
-            writeln!(f, "{}  [Callables]", indent_str)?;
-            for (name, symbol_id) in callable_symbols {
-                let symbol = self.get_symbol(symbol_id);
-                writeln!(
-                    f,
-                    "{}    {} : {:?} = {:?}",
-                    indent_str,
-                    name,
-                    symbol.kind,
-                    symbol
-                        .ty
-                        .as_ref()
-                        .map(|t| format!("{}", t))
-                        .unwrap_or("?".to_string())
-                )?;
-            }
-        }
-
-        if !value_symbols.is_empty() {
-            writeln!(f, "{}  [Values]", indent_str)?;
-            for (name, symbol_id) in value_symbols {
-                let symbol = self.get_symbol(symbol_id);
-                writeln!(
-                    f,
-                    "{}    {} : {:?} = {:?}",
-                    indent_str,
-                    name,
-                    symbol.kind,
-                    symbol
-                        .ty
-                        .as_ref()
-                        .map(|t| format!("{}", t))
-                        .unwrap_or("?".to_string())
-                )?;
-            }
-        }
-
-        // Find and display child scopes
-        for (id, child_scope) in self.scopes.iter().enumerate() {
-            if let Some(parent_id) = child_scope.parent {
-                if parent_id == scope_id {
-                    self.fmt_scope(f, id, indent + 1)?;
-                }
-            }
-        }
-
-        Ok(())
     }
 }

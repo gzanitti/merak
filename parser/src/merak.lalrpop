@@ -51,6 +51,8 @@ match {
     "msg.value",
     "block.timestamp",
     "old",
+    "interface",
+    ".",
 
     // Operators
     "||",
@@ -93,12 +95,14 @@ match {
     r"[a-zA-Z][a-zA-Z0-9_]*" => IDENT,
 }
 
-pub Program: Contract = {
-    <imports:Import*> <data:ContractInit> <state_defs:StateSpecificContract*> => {
-        Contract {
+pub File: File = {
+    <imports:Import*> 
+    <interfaces:InterfaceDecl*>
+    <contract:Contract>  => {
+        File {
             imports,
-            data,
-            state_defs,
+            interfaces,
+            contract,
         }
     }
 };
@@ -115,6 +119,7 @@ Import: Import = {
             contract_name,
             file_path,
             alias: None,
+            id: id_gen.next(),
             source_ref: SourceRef::new(start, end),
         }
     },
@@ -124,6 +129,7 @@ Import: Import = {
             contract_name,
             file_path,
             alias: Some(alias),
+            id: id_gen.next(),
             source_ref: SourceRef::new(start, end),
         }
     },
@@ -142,10 +148,39 @@ RelativePath: String = {
     <s:RELATIVE_PATH> => s.to_string(),
 };
 
-ContractInit: ContractInit = {
-    <start:@L> "contract" <name:Ident> "[" <states:States?> "]" "{"
+InterfaceDecl: InterfaceDecl = {
+    <start:@L> "interface" <name:Ident> "{" 
+    <functions:InterfaceFunctionSig*> 
+    "}" <end:@R> => {
+        InterfaceDecl {
+            name,
+            functions,
+            id: id_gen.next(),
+            source_ref: SourceRef::new(start, end),
+        }
+    }
+};
+
+InterfaceFunctionSig: InterfaceFunctionSig = {
+    <start:@L> "external" "function" <name:Ident> 
+    "(" <params:ParamList?> ")" 
+    <return_type:("->" <TypeWithNamedBinder>)?> 
+    ";" <end:@R> => {
+        InterfaceFunctionSig {
+            name,
+            params: params.unwrap_or_default(),
+            return_type,
+            id: id_gen.next(),
+            source_ref: SourceRef::new(start, end),
+        }
+    }
+};
+
+Contract: Contract = {
+    <start:@L> "contract" <name:Ident> "{"
     <declarations:StateItem*>
-    <constructor:Constructor?> "}" <end:@R> => {
+    <constructor:Constructor?>
+    <functions:Function*> "}" <end:@R> => {
         let mut variables = Vec::new();
         let mut constants = Vec::new();
         for decl in declarations {
@@ -154,7 +189,7 @@ ContractInit: ContractInit = {
                 StateItem::Const(c) => constants.push(c),
             }
         }
-        ContractInit { name, states: states.unwrap_or_default(), variables, constants, constructor }
+        Contract { name, variables, constants, constructor, functions, id: id_gen.next(), source_ref: SourceRef::new(start, end) }
     }
 };
 
@@ -202,29 +237,29 @@ Constructor: Constructor = {
     }
 };
 
-StateSpecificContract: (String, StateDef) = {
-    <start:@L> <contract:Ident> "@" <name:StateNameOrGlobal> "(" <owner:StateOwner> ")" "{" <functions:Function*> "}" <end:@R> => {
-        let state_def = StateDef {
-            contract,
-            name: name.clone(),
-            owner,
-            functions,
-            source_ref: SourceRef::new(start, end),
-        };
-        (name, state_def)
-    }
-};
+// StateSpecificContract: (String, StateDef) = {
+//     <start:@L> <contract:Ident> "@" <name:StateNameOrGlobal> "(" <owner:StateOwner> ")" "{" <functions:Function*> "}" <end:@R> => {
+//         let state_def = StateDef {
+//             contract,
+//             name: name.clone(),
+//             owner,
+//             functions,
+//             source_ref: SourceRef::new(start, end),
+//         };
+//         (name, state_def)
+//     }
+// };
 
-StateNameOrGlobal: String = {
-    "Global" => "Global".to_string(),  
-    <Ident> => <>,                     
-};
+// StateNameOrGlobal: String = {
+//     "Global" => "Global".to_string(),  
+//     <Ident> => <>,                     
+// };
 
-StateOwner: Owner = {
-    <Ident> => Owner::Ident(<>),
-    <Address> => Owner::Address(<>),
-    "any" => Owner::Any,
-};
+// StateOwner: Owner = {
+//     <Ident> => Owner::Ident(<>),
+//     <Address> => Owner::Address(<>),
+//     "any" => Owner::Any,
+// };
 
 Function: Function = {
     <start:@L> <visibility:FnVisibility> <name:Ident>  "(" <params:ParamList?> ")" <modifiers: FnModifier*>
@@ -289,13 +324,13 @@ ParamList: Vec<Param> = {
 
 TypeWithNamedBinder: Type = {
     <start:@L>"{" <explicit_binder:Ident>":"<base_type:BaseType> "|" <constraint:Predicate> "}" <end:@R> => {
-        Type { base: base_type, binder: explicit_binder, constraint, source_ref: SourceRef::new(start, end) }
+        Type { base: base_type, binder: explicit_binder, constraint, explicit_annotation: true, source_ref: SourceRef::new(start, end) }
     },
     <start:@L>"{" <base_type:BaseType> "|" <constraint:Predicate> "}" <end:@R> => {
-        Type { base: base_type, binder: "_self".to_string(), constraint, source_ref: SourceRef::new(start, end) }
+        Type { base: base_type, binder: "_self".to_string(), constraint, explicit_annotation: true, source_ref: SourceRef::new(start, end) }
     },
     <start:@L><base_type:BaseType><end:@R> => {
-        Type { base: base_type, binder: "_self".to_string(), constraint: Predicate::True(id_gen.next(), SourceRef::new(start, end)), source_ref: SourceRef::new(start, end) }
+        Type { base: base_type, binder: "_self".to_string(), constraint: Predicate::True(id_gen.next(), SourceRef::new(start, end)), explicit_annotation: true, source_ref: SourceRef::new(start, end) }
     },
 };
 
@@ -306,6 +341,7 @@ BaseType: BaseType = {
     "address" => BaseType::Address,
     "bool" => BaseType::Bool,
     "string" => BaseType::String,
+    <ident:Ident> => BaseType::Contract(ident)
 };
 
 // Statements
@@ -371,7 +407,7 @@ Statement: Statement = {
             source_ref: SourceRef::new(start, end) 
         }
     },
-    <start:@L>"become" <state:Ident> ";"<end:@R> => Statement::Become(state, id_gen.next(), SourceRef::new(start, end)),
+    //<start:@L>"become" <state:Ident> ";"<end:@R> => Statement::Become(state, id_gen.next(), SourceRef::new(start, end)),
 };
 
 LoopProperties: (Vec<Predicate>, Vec<RefinementExpr>) = "with" <props:PropertiesList> => {
@@ -490,18 +526,57 @@ UnaryOp: UnaryOperator = {
     "!" => UnaryOperator::Not,
 };
 
+// Primary: Expression = {
+//     <start:@L><lit:Literal><end:@R> => Expression::Literal(lit, id_gen.next(), SourceRef::new(start, end)),
+//     <start:@L><name:Ident> "(" <args:FunctionArgs> ")"<end:@R> => {
+//         Expression::FunctionCall {
+//             name: name,
+//             args: args,
+//             id: id_gen.next(),
+//             source_ref: SourceRef::new(start, end)
+//         }
+//     },
+//     <start:@L><iden:Ident><end:@R> => Expression::Identifier(iden, id_gen.next(), SourceRef::new(start, end)),
+//     "(" <Expression> ")",
+// };
+
 Primary: Expression = {
-    <start:@L><lit:Literal><end:@R> => Expression::Literal(lit, id_gen.next(), SourceRef::new(start, end)),
+    <base:PrimaryBase> <accesses:MemberAccess*> => {
+        accesses.into_iter().fold(base, |acc, (member, args, start, end)| {
+            Expression::MemberCall {
+                object: Box::new(acc),
+                method: member,
+                args,
+                id: id_gen.next(),
+                source_ref: SourceRef::new(start, end),
+            }
+        })
+    }
+};
+
+PrimaryBase: Expression = {
+    <start:@L><lit:Literal><end:@R> => 
+        Expression::Literal(lit, id_gen.next(), SourceRef::new(start, end)),
+    
     <start:@L><name:Ident> "(" <args:FunctionArgs> ")"<end:@R> => {
         Expression::FunctionCall {
-            name: name,
-            args: args,
+            name,
+            args,
             id: id_gen.next(),
-            source_ref: SourceRef::new(start, end)
+            source_ref: SourceRef::new(start, end),
         }
     },
-    <start:@L><iden:Ident><end:@R> => Expression::Identifier(iden, id_gen.next(), SourceRef::new(start, end)),
+    
+    <start:@L><iden:Ident><end:@R> => 
+        Expression::Identifier(iden, id_gen.next(), SourceRef::new(start, end)),
+    
     "(" <Expression> ")",
+};
+
+MemberAccess: (String, Vec<Expression>, usize, usize) = {
+    <start:@L> "." <method:Ident> "(" <args:FunctionArgs> ")" <end:@R> => {
+        (method, args, start, end)
+    }
 };
 
 FunctionArgs: Vec<Expression> = {
@@ -522,10 +597,6 @@ Literal: Literal = {
     <Boolean> => Literal::Boolean(<>),
 };
 
-
-// ============================================================================
-// PREDICATES: Para refinamientos de tipos
-// ============================================================================
 
 pub Predicate: Predicate = LogicalOrPred;
 
@@ -552,15 +623,12 @@ ComparisonPred: Predicate = {
                 id: id_gen.next(),
                 source_ref: SourceRef::new(start, end),
             },
-            // Caso 2: No hay operador, debe ser una variable booleana solitaria (ej: is_valid)
             None => {
                 match lhs {
-                    // Convertimos la variable de refinamiento a variable de predicado
                     RefinementExpr::Var(id, node_id, sr) => Predicate::Var(id, node_id, sr),
                     RefinementExpr::UninterpFn { name, args, id, source_ref } => Predicate::UninterpFnCall{name, args, id, source_ref},
 
-                    // Cualquier otra cosa (ej: "5", "x + 1") no es un predicado válido por sí mismo
-                    _ => panic!("Error de sintaxis: Se esperaba una comparación o una variable booleana, se encontró una expresión aritmética."),
+                    _ => panic!("Syntax error: Expected a comparison or a boolean variable, but found an arithmetic expression."),
                 }
             }
         }
@@ -588,9 +656,6 @@ PredicatePrimary: Predicate = {
     "(" <Predicate> ")",
 };
 
-// ============================================================================
-// REFINEMENT EXPRESSIONS: Expresiones dentro de predicados y variantes
-// ============================================================================
 
 pub RefinementExpr: RefinementExpr = RefinementArith;
 
@@ -661,8 +726,7 @@ RefinementFactor: RefinementExpr = {
 };
 
 RefinementPrimary: RefinementExpr = {
-    // Función no interpretada
-    // Ejemplos: len(arr), owner(contract), balance_of(addr)
+    // Example: len(arr), owner(contract), balance_of(addr)
     <start:@L><name:Ident> "(" <args:RefinementArgs> ")"<end:@R> => {
         RefinementExpr::UninterpFn {
             name,

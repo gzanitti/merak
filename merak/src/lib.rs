@@ -2,7 +2,7 @@ use std::{collections::HashMap, path::PathBuf};
 
 use indexmap::IndexMap;
 use merak_analyzer::{analyze, analyze_ssa};
-use merak_ast::contract::Program;
+use merak_ast::{NodeIdGenerator, contract::Program};
 use merak_errors::MerakError;
 use merak_ir::transformers::ssa::SsaBuilder;
 use merak_parser::parse_file;
@@ -40,38 +40,42 @@ impl Compiler {
 
 fn load_program(entry_path: &PathBuf) -> Result<Program, MerakError> {
     let mut loaded = Program {
-        contracts: IndexMap::new(),
+        files: IndexMap::new(),
     };
 
     let mut visited = HashMap::new();
-    load_recursive(entry_path, &mut loaded, &mut visited, None)?;
+    let id_gen = NodeIdGenerator::new();
+    load_recursive(entry_path, &mut loaded, &mut visited, None, &id_gen)?;
 
     Ok(loaded)
 }
 
-fn load_recursive(
+pub fn load_recursive(
     file_path: &PathBuf,
     loaded: &mut Program,
     visited: &mut HashMap<PathBuf, bool>,
     alias: Option<String>,
+    id_gen: &NodeIdGenerator,
 ) -> Result<(), MerakError> {
     if visited.contains_key(file_path) {
         return Ok(());
     }
     visited.insert(file_path.clone(), true);
 
-    let contract = parse_file(&file_path)?;
+    let file = parse_file(&file_path, &id_gen)?;
 
     // If available, use the alias provided by the import
-    let contract_key = alias.unwrap_or_else(|| contract.data.name.clone());
+    let contract_key = alias.unwrap_or_else(|| file.contract.name.clone());
 
     println!("Import path: {}", file_path.display());
-    loaded.contracts.insert(contract_key, contract.clone());
+    
 
-    for imp in contract.imports {
+    for imp in &file.imports {
         let import_path = resolve_import_path(file_path, &imp.file_path)?;
-        load_recursive(&import_path, loaded, visited, imp.alias)?;
+        load_recursive(&import_path, loaded, visited, imp.alias.clone(), &id_gen)?;
     }
+
+    loaded.files.insert(contract_key, file);
 
     Ok(())
 }

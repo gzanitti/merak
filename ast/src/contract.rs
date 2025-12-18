@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use super::meta::SourceRef;
 
 pub struct Program {
-    pub contracts: IndexMap<String, Contract>,
+    pub files: IndexMap<String, File>,
 }
 
 /// Represents an import statement.
@@ -28,24 +28,44 @@ pub struct Import {
     pub file_path: PathBuf,
     /// Optional alias for the imported contract
     pub alias: Option<String>,
-    /// Source location for error reporting
+    pub id: NodeId,
     pub source_ref: SourceRef,
 }
 
 #[derive(Debug, Clone)]
-pub struct Contract {
-    pub imports: Vec<Import>,
-    pub data: ContractInit,
-    pub state_defs: Vec<(String, StateDef)>,
+pub struct InterfaceDecl {
+    pub name: String,
+    pub functions: Vec<InterfaceFunctionSig>,
+    pub id: NodeId,
+    pub source_ref: SourceRef,
 }
 
 #[derive(Debug, Clone)]
-pub struct ContractInit {
+pub struct InterfaceFunctionSig {
     pub name: String,
-    pub states: Vec<String>,
+    pub params: Vec<Param>,
+    pub return_type: Option<Type>,
+    pub id: NodeId,
+    pub source_ref: SourceRef,
+}
+
+#[derive(Debug, Clone)]
+pub struct File {
+    pub imports: Vec<Import>,
+    pub interfaces: Vec<InterfaceDecl>,
+    pub contract: Contract,
+    // pub state_defs: Vec<(String, StateDef)>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Contract{
+    pub name: String,
+    pub id: NodeId,
     pub variables: Vec<StateVar>,
     pub constants: Vec<StateConst>,
     pub constructor: Option<Constructor>,
+    pub functions: Vec<Function>,
+    pub source_ref: SourceRef,
 }
 
 #[derive(Debug, Clone)]
@@ -56,21 +76,21 @@ pub struct Constructor {
     pub source_ref: SourceRef,
 }
 
-#[derive(Debug, Clone)]
-pub struct StateDef {
-    pub contract: String,
-    pub name: String,
-    pub owner: Owner,
-    pub functions: Vec<Function>,
-    pub source_ref: SourceRef,
-}
+// #[derive(Debug, Clone)]
+// pub struct StateDef {
+//     pub contract: String,
+//     pub name: String,
+//     pub owner: Owner,
+//     pub functions: Vec<Function>,
+//     pub source_ref: SourceRef,
+// }
 
-#[derive(Debug, Clone)]
-pub enum Owner {
-    Address(String),
-    Ident(String),
-    Any,
-}
+// #[derive(Debug, Clone)]
+// pub enum Owner {
+//     Address(String),
+//     Ident(String),
+//     Any,
+// }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Param {
@@ -92,17 +112,7 @@ impl Constructor {
     }
 }
 
-impl Contract {
-    /// Returns all functions from all state definitions
-    pub fn all_functions(&self) -> Vec<Function> {
-        self.state_defs
-            .iter()
-            .flat_map(|(_, state_def)| state_def.functions.clone())
-            .collect()
-    }
-}
-
-impl fmt::Display for Contract {
+impl fmt::Display for File {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // Print imports
         for import in &self.imports {
@@ -112,10 +122,7 @@ impl fmt::Display for Contract {
             writeln!(f)?;
         }
 
-        writeln!(f, "{}", self.data)?;
-        for (_, state_def) in self.state_defs.iter() {
-            writeln!(f, "{}", state_def)?;
-        }
+        writeln!(f, "{}", self.contract)?;
         Ok(())
     }
 }
@@ -135,14 +142,14 @@ impl fmt::Display for Import {
     }
 }
 
-impl fmt::Display for ContractInit {
+impl fmt::Display for Contract {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "contract {}", self.name)?;
-        if !self.states.is_empty() {
-            write!(f, "[{}]", self.states.join(", "))?;
-        } else {
-            write!(f, "[]")?; // TODO: Invalid?
-        }
+        // if !self.states.is_empty() {
+        //     write!(f, "[{}]", self.states.join(", "))?;
+        // } else {
+        //     write!(f, "[]")?; // TODO: Invalid?
+        // }
         writeln!(f, " {{")?;
 
         for var in &self.variables {
@@ -155,6 +162,11 @@ impl fmt::Display for ContractInit {
         if let Some(constructor) = &self.constructor {
             writeln!(f)?;
             writeln!(f, "    {}", constructor)?;
+        }
+
+        for func in &self.functions {
+            writeln!(f)?;
+            writeln!(f, "    {}", func)?;
         }
 
         writeln!(f, "}}")?;
@@ -178,21 +190,21 @@ impl fmt::Display for Constructor {
     }
 }
 
-impl fmt::Display for StateDef {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}@{}(", self.contract, self.name)?;
-        match &self.owner {
-            Owner::Address(addr) => write!(f, "{}", addr)?,
-            Owner::Ident(id) => write!(f, "{}", id)?,
-            Owner::Any => write!(f, "any")?,
-        }
-        writeln!(f, ") {{")?;
-        for func in &self.functions {
-            writeln!(f, "{}", func)?;
-        }
-        write!(f, "}}")
-    }
-}
+// impl fmt::Display for StateDef {
+//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+//         write!(f, "{}@{}(", self.contract, self.name)?;
+//         match &self.owner {
+//             Owner::Address(addr) => write!(f, "{}", addr)?,
+//             Owner::Ident(id) => write!(f, "{}", id)?,
+//             Owner::Any => write!(f, "any")?,
+//         }
+//         writeln!(f, ") {{")?;
+//         for func in &self.functions {
+//             writeln!(f, "{}", func)?;
+//         }
+//         write!(f, "}}")
+//     }
+// }
 
 impl fmt::Display for Param {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

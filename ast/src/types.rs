@@ -11,6 +11,7 @@ pub struct Type {
     pub base: BaseType,
     pub binder: String,
     pub constraint: Predicate,
+    pub explicit_annotation: bool,
     pub source_ref: SourceRef,
 }
 
@@ -34,17 +35,18 @@ pub enum BaseType {
         parameters: Vec<Type>,
         return_type: Box<Type>,
     },
+    Contract(String)
 }
 
 impl Type {
-    pub fn new(base: BaseType, binder: String) -> Self {
-        Type {
-            base,
-            binder,
-            constraint: Predicate::True(NodeId::from(0), SourceRef::unknown()),
-            source_ref: SourceRef::unknown(),
-        }
-    }
+    // pub fn new(base: BaseType, binder: String) -> Self {
+    //     Type {
+    //         base,
+    //         binder,
+    //         constraint: Predicate::True(NodeId::from(0), SourceRef::unknown()),
+    //         source_ref: SourceRef::unknown(),
+    //     }
+    // }
 
     pub fn with_binder(&mut self, binder: String) {
         self.binder = binder;
@@ -55,12 +57,17 @@ impl Type {
             base: BaseType::Tuple { elems: vec![] },
             binder: binder.clone(),
             constraint: Predicate::True(NodeId::from(0), SourceRef::unknown()),
+            explicit_annotation: true,
             source_ref: SourceRef::unknown(),
         }
     }
 
     pub fn is_true_literal(&self) -> bool {
         matches!(&self.constraint, Predicate::True(_, _))
+    }
+
+    pub fn is_explicit_annotation(&self) -> bool {
+        self.explicit_annotation
     }
 }
 
@@ -83,6 +90,7 @@ impl fmt::Display for BaseType {
                 let params_str: Vec<String> = parameters.iter().map(|p| p.to_string()).collect();
                 write!(f, "{name}({} -> {return_type})", params_str.join(", "))
             }
+            BaseType::Contract(name) => write!(f, "{}", name),
         }
     }
 }

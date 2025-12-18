@@ -1,9 +1,8 @@
 use crate::refinements::constraints::TypeContext;
 use crate::refinements::templates::{LiquidVar, LiquidVarGenerator, Template};
-use crate::storage::StorageAnalysis;
 use merak_ast::predicate::Predicate;
 use merak_ast::types::Type;
-use merak_symbols::{SymbolId, SymbolNamespace, SymbolTable};
+use merak_symbols::{SymbolId, SymbolInfo, SymbolNamespace, SymbolTable};
 use std::collections::HashMap;
 
 /// Type environment for refinement inference
@@ -30,21 +29,17 @@ pub struct TypeEnvironment<'a> {
 
     /// Current function being analyzed (if any)
     current_function: Option<SymbolId>,
-
-    /// Storage analysis results
-    pub storage_analysis: StorageAnalysis,
 }
 
 impl<'a> TypeEnvironment<'a> {
     /// Create a new type environment
-    pub fn new(symbol_table: &'a mut SymbolTable, storage_analysis: StorageAnalysis) -> Self {
+    pub fn new(symbol_table: &'a mut SymbolTable, ) -> Self {
         Self {
             symbol_table,
             liquid_gen: LiquidVarGenerator::new(),
             local_bindings: HashMap::new(),
             assumptions: Vec::new(),
             current_function: None,
-            storage_analysis,
         }
     }
 
@@ -90,25 +85,33 @@ impl<'a> TypeEnvironment<'a> {
         self.local_bindings.remove(name)
     }
 
-    /// Look up a variable (checks locals first, then symbol table)
-    pub fn lookup(&self, name: &str) -> Option<Template> {
-        // First check local bindings
-        if let Some(template) = self.local_bindings.get(name) {
-            return Some(template.clone());
-        }
-
-        // Then check symbol table
-        if let Some(symbol_id) = self.symbol_table.lookup(name, SymbolNamespace::Value) {
-            let symbol = self.symbol_table.get_symbol(symbol_id);
-            if let Some(ty) = &symbol.ty {
-                // Clone liquid_gen for the conversion
-                let mut gen = self.liquid_gen.clone();
-                return Some(Template::from_type(ty, &mut gen));
-            }
-        }
-
-        None
+    pub fn get_local(&self, name: &str) -> Option<Template> {
+        self.local_bindings.get(name).cloned()
     }
+
+    pub fn lookup(&self, name: &str) -> Option<Template> {
+        self.local_bindings.get(name).cloned()
+    }
+
+    /// Look up a variable (checks locals first, then symbol table)
+    // pub fn lookup(&self, name: &str) -> Option<Template> {
+    //     // First check local bindings
+    //     if let Some(template) = self.local_bindings.get(name) {
+    //         return Some(template.clone());
+    //     }
+
+    //     // Then check symbol table
+    //     if let Some(symbol_id) = self.symbol_table.lookup(name, SymbolNamespace::Value) {
+    //         let symbol = self.symbol_table.get_symbol(symbol_id);
+    //         if let Some(ty) = &symbol.ty {
+    //             // Clone liquid_gen for the conversion
+    //             let mut gen = self.liquid_gen.clone();
+    //             return Some(Template::from_type(ty, &mut gen));
+    //         }
+    //     }
+
+    //     None
+    // }
 
     /// Add a path assumption (from if/while guard)
     pub fn add_assumption(&mut self, predicate: Predicate) {
@@ -197,6 +200,10 @@ impl<'a> TypeEnvironment<'a> {
         ctx
     }
 
+    pub fn get_symbol(&self, symbol_id: SymbolId) -> &SymbolInfo {
+        self.symbol_table.get_symbol(symbol_id)
+    } 
+
     /// Get the type of a symbol from the symbol table
     pub fn get_symbol_type(&self, symbol_id: SymbolId) -> Option<&Type> {
         self.symbol_table.get_symbol(symbol_id).ty.as_ref()
@@ -254,40 +261,40 @@ impl<'a> TypeEnvironment<'a> {
     }
 }
 
-/// Helper struct for managing scoped local bindings
-///
-/// This ensures bindings are cleaned up even in early returns or panics
-pub struct ScopedBinding<'a, 'env> {
-    env: &'a mut TypeEnvironment<'env>,
-    name: String,
-}
+// /// Helper struct for managing scoped local bindings
+// ///
+// /// This ensures bindings are cleaned up even in early returns or panics
+// pub struct ScopedBinding<'a, 'env> {
+//     env: &'a mut TypeEnvironment<'env>,
+//     name: String,
+// }
 
-impl<'a, 'env> ScopedBinding<'a, 'env> {
-    /// Create a new scoped binding
-    pub fn new(env: &'a mut TypeEnvironment<'env>, name: String, template: Template) -> Self {
-        env.bind_local(name.clone(), template);
-        Self { env, name }
-    }
-}
+// impl<'a, 'env> ScopedBinding<'a, 'env> {
+//     /// Create a new scoped binding
+//     pub fn new(env: &'a mut TypeEnvironment<'env>, name: String, template: Template) -> Self {
+//         env.bind_local(name.clone(), template);
+//         Self { env, name }
+//     }
+// }
 
-impl<'a, 'env> Drop for ScopedBinding<'a, 'env> {
-    fn drop(&mut self) {
-        self.env.unbind_local(&self.name);
-    }
-}
+// impl<'a, 'env> Drop for ScopedBinding<'a, 'env> {
+//     fn drop(&mut self) {
+//         self.env.unbind_local(&self.name);
+//     }
+// }
 
-impl<'a> TypeEnvironment<'a> {
-    /// Create a scoped local binding that is automatically cleaned up
-    ///
-    /// # Example
-    /// ```
-    /// {
-    ///     let _binding = env.scoped_binding("temp".to_string(), template);
-    ///     // temp is in scope here
-    /// }
-    /// // temp is automatically removed when _binding is dropped
-    /// ```
-    pub fn scoped_binding(&mut self, name: String, template: Template) -> ScopedBinding<'_, 'a> {
-        ScopedBinding::new(self, name, template)
-    }
-}
+// impl<'a> TypeEnvironment<'a> {
+//     /// Create a scoped local binding that is automatically cleaned up
+//     ///
+//     /// # Example
+//     /// ```
+//     /// {
+//     ///     let _binding = env.scoped_binding("temp".to_string(), template);
+//     ///     // temp is in scope here
+//     /// }
+//     /// // temp is automatically removed when _binding is dropped
+//     /// ```
+//     pub fn scoped_binding(&mut self, name: String, template: Template) -> ScopedBinding<'_, 'a> {
+//         ScopedBinding::new(self, name, template)
+//     }
+// }

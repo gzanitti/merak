@@ -133,6 +133,8 @@ impl<'ctx> SmtSolver<'ctx> {
         let z3_consequent = self.predicate_to_z3(consequent, &mut var_context)?;
         self.solver.assert(&z3_consequent.not());
 
+        println!("Z3 antecedent: {:?}, consequent: {:?}", z3_antecedent, z3_consequent);
+
         // Check satisfiability
         let result = match self.solver.check() {
             SatResult::Unsat => SmtResult::Unsatisfiable, // Valid implication!

@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{collections::HashMap, fmt};
 
 use crate::meta::SourceRef;
 use crate::node_id::NodeId;
@@ -204,6 +204,61 @@ impl Predicate {
             }
         }
     }
+
+    pub fn substitute_vars(&self, stacks: &HashMap<String, String>) -> Predicate {
+        match self {
+            Predicate::True(node_id, source_ref) => {
+                Predicate::True(*node_id, source_ref.clone())
+            }
+            Predicate::False(node_id, source_ref) => {
+                Predicate::False(*node_id, source_ref.clone())
+            }
+            Predicate::Var(name, node_id, source_ref) => {
+                if let Some(new_name) = stacks.get(name) {
+                    Predicate::Var(new_name.clone(), *node_id, source_ref.clone())
+                } else {
+                    // Keep the original variable if not in mapping
+                    Predicate::Var(name.clone(), *node_id, source_ref.clone())
+                }
+            }
+            Predicate::UninterpFnCall { name, args, id, source_ref } => Predicate::UninterpFnCall {
+                name: name.clone(),
+                args: args.iter().map(|arg| arg.substitute_vars(stacks)).collect(),
+                id: *id,
+                source_ref: source_ref.clone(),
+            },
+            Predicate::BinRel { op, lhs, rhs, id, source_ref } => Predicate::BinRel {
+                op: *op,
+                lhs: lhs.substitute_vars(stacks),
+                rhs: rhs.substitute_vars(stacks),
+                id: *id,
+                source_ref: source_ref.clone(),
+            },
+            Predicate::And(left, right, node_id, source_ref) => Predicate::And(
+                Box::new(left.substitute_vars(stacks)),
+                Box::new(right.substitute_vars(stacks)),
+                *node_id,
+                source_ref.clone(),
+            ),
+            Predicate::Or(left, right, node_id, source_ref) => Predicate::Or(
+                Box::new(left.substitute_vars(stacks)),
+                Box::new(right.substitute_vars(stacks)),
+                *node_id,
+                source_ref.clone(),
+            ),
+            Predicate::Not(pred, node_id, source_ref) => Predicate::Not(
+                Box::new(pred.substitute_vars(stacks)),
+                *node_id,
+                source_ref.clone(),
+            ),
+            Predicate::Implies(left, right, node_id, source_ref) => Predicate::Implies(
+                Box::new(left.substitute_vars(stacks)),
+                Box::new(right.substitute_vars(stacks)),
+                *node_id,
+                source_ref.clone(),
+            ),
+        }
+    }
 }
 
 impl fmt::Display for Predicate {
@@ -289,6 +344,58 @@ impl RefinementExpr {
             RefinementExpr::UnaryOp { expr, .. } => expr.contains_old(),
             RefinementExpr::UninterpFn { args, .. } => args.iter().any(|arg| arg.contains_old()),
             RefinementExpr::Old { expr, .. } => expr.contains_old(),
+        }
+    }
+
+    pub fn substitute_vars(&self, stacks: &HashMap<String, String>) -> RefinementExpr {
+        match self {
+            RefinementExpr::Var(var, node_id, source_ref) => {
+                if let Some(new_var) = stacks.get(var) {
+                    RefinementExpr::Var(new_var.clone(), *node_id, source_ref.clone())
+                } else {
+                    // Keep the original variable if not in mapping
+                    RefinementExpr::Var(var.clone(), *node_id, source_ref.clone())
+                }
+            }
+            RefinementExpr::IntLit(value, node_id, source_ref) => {
+                RefinementExpr::IntLit(*value, *node_id, source_ref.clone())
+            }
+            RefinementExpr::AddressLit(value, node_id, source_ref) => {
+                RefinementExpr::AddressLit(value.clone(), *node_id, source_ref.clone())
+            }
+            RefinementExpr::MsgSender(node_id, source_ref) => {
+                RefinementExpr::MsgSender(*node_id, source_ref.clone())
+            }
+            RefinementExpr::MsgValue(node_id, source_ref) => {
+                RefinementExpr::MsgValue(*node_id, source_ref.clone())
+            }
+            RefinementExpr::BlockTimestamp(node_id, source_ref) => {
+                RefinementExpr::BlockTimestamp(*node_id, source_ref.clone())
+            }
+            RefinementExpr::BinOp { op, lhs, rhs, id, source_ref } => RefinementExpr::BinOp {
+                op: *op,
+                lhs: Box::new(lhs.substitute_vars(stacks)),
+                rhs: Box::new(rhs.substitute_vars(stacks)),
+                id: *id,
+                source_ref: source_ref.clone(),
+            },
+            RefinementExpr::UnaryOp { op, expr, id, source_ref } => RefinementExpr::UnaryOp {
+                op: *op,
+                expr: Box::new(expr.substitute_vars(stacks)),
+                id: *id,
+                source_ref: source_ref.clone(),
+            },
+            RefinementExpr::UninterpFn { name, args, id, source_ref } => RefinementExpr::UninterpFn {
+                name: name.clone(),
+                args: args.iter().map(|arg| arg.substitute_vars(stacks)).collect(),
+                id: *id,
+                source_ref: source_ref.clone(),
+            },
+            RefinementExpr::Old { expr, id, source_ref } => RefinementExpr::Old {
+                expr: Box::new(expr.substitute_vars(stacks)),
+                id: *id,
+                source_ref: source_ref.clone(),
+            },
         }
     }
 }

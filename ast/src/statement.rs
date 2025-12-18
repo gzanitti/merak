@@ -48,7 +48,7 @@ pub enum Statement {
         id: NodeId,
         source_ref: SourceRef,
     },
-    Become(String, NodeId, SourceRef),
+    //Become(String, NodeId, SourceRef),
 }
 
 impl Statement {
@@ -61,7 +61,7 @@ impl Statement {
             Statement::Assignment { id, .. } => *id,
             Statement::VarDeclaration { id, .. } => *id,
             Statement::ConstDeclaration { id, .. } => *id,
-            Statement::Become(_, id, _) => *id,
+            //Statement::Become(_, id, _) => *id,
         }
     }
 }
@@ -194,7 +194,7 @@ impl fmt::Display for Statement {
                 Some(t) => write!(f, "const {}: {} = {}", name, t, expr),
                 None => write!(f, "const {} = {}", name, expr),
             },
-            Statement::Become(new_state, _, _) => write!(f, "become {}", new_state),
+            //Statement::Become(new_state, _, _) => write!(f, "become {}", new_state),
         }
     }
 }

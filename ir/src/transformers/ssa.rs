@@ -2,19 +2,17 @@ use std::cell::Cell;
 
 use indexmap::IndexMap;
 use merak_ast::{
-    contract::{Contract, ContractInit, Program, StateDef},
-    expression::{BinaryOperator, Expression, Literal, UnaryOperator},
+    contract::{Contract, File, Program},
+    expression::{Expression, Literal},
     function::Function,
-    predicate::{self, ArithOp, Predicate, RefinementExpr, RelOp, UnaryOp},
     statement::{Block, Statement},
     types::BaseType,
 };
 use merak_errors::MerakError;
-use merak_symbols::{QualifiedName, SymbolId, SymbolKind, SymbolTable};
+use merak_symbols::{SymbolId, SymbolKind, SymbolTable};
 
 use crate::ssa_ir::{
-    BlockId, CallTarget, Constant, Operand, Register, SsaCfg, SsaContract, SsaContractInit,
-    SsaInstruction, SsaProgram, SsaStateDef, Terminator,
+    BlockId, CallTarget, Constant, Operand, Register, SsaCfg, SsaContract, SsaFile, SsaInstruction, SsaProgram, Terminator
 };
 
 pub struct SsaBuilder {
@@ -47,65 +45,46 @@ impl SsaBuilder {
 
     pub fn build(&mut self, program: &Program) -> Result<SsaProgram, MerakError> {
         let mut ssa_program = SsaProgram {
-            contracts: IndexMap::new(),
+            files: IndexMap::new(),
         };
 
-        for contract_data in program.contracts.iter() {
-            self.build_contract(contract_data, &mut ssa_program)?;
-
-            // // Debug print: log SsaCfgs found inside state_defs of the just built contract
-            // let (contract_name, _contract) = contract_data;
-            // if let Some(ssa_contract) = ssa_program.contracts.get(contract_name) {
-            //     eprintln!("[SSA DEBUG] Contract: {}", contract_name);
-            //     for (state_name, state_def) in &ssa_contract.state_defs {
-            //         eprintln!("  [SSA DEBUG] StateDef: {}", state_name);
-            //         for (idx, func_cfg) in state_def.functions.iter().enumerate() {
-            //             // Attempt to print basic CFG info; assuming SsaCfg implements Debug will print the whole CFG
-            //             // Otherwise, print a minimal summary via available fields
-            //             eprintln!("    [SSA DEBUG] Function #{} CFG: {:?}", idx, func_cfg);
-            //         }
-            //     }
-            // }
+        for contract_data in program.files.iter() {
+            self.build_file(contract_data, &mut ssa_program)?;
         }
 
         Ok(ssa_program)
     }
 
-    fn build_contract(
+    fn build_file(
         &mut self,
-        contract_data: (&String, &Contract),
+        contract_data: (&String, &File),
         ssa_program: &mut SsaProgram,
     ) -> Result<(), MerakError> {
-        let (contract_name, contract) = contract_data;
+        let (contract_name, file) = contract_data;
 
-        let ssa_contract_init = self.build_contract_init(&contract.data)?;
-        let mut ssa_state_defs = vec![];
-        for (name, state_def) in contract.state_defs.iter() {
-            let ssa_state_def = self.build_state_def(state_def)?;
-            ssa_state_defs.push((name.clone(), ssa_state_def));
-        }
+        let ssa_contract = self.build_contract(&file.contract)?;
 
-        let ssa_contract = SsaContract {
-            imports: contract.imports.clone(),
-            data: ssa_contract_init,
-            state_defs: ssa_state_defs,
+        let ssa_file = SsaFile {
+            imports: file.imports.clone(),
+            interfaces: file.interfaces.clone(),
+            contract: ssa_contract,
         };
 
         ssa_program
-            .contracts
-            .insert(contract_name.clone(), ssa_contract);
+            .files
+            .insert(contract_name.clone(), ssa_file);
 
         Ok(())
     }
 
-    fn build_contract_init(&mut self, init: &ContractInit) -> Result<SsaContractInit, MerakError> {
-        let constructor_cfg = if let Some(constructor) = &init.constructor {
+    fn build_contract(&mut self, contract: &Contract) -> Result<SsaContract, MerakError> {
+        let constructor_cfg = if let Some(constructor) = &contract.constructor {
             let constructor_id = self
                 .symbol_table
                 .get_symbol_id_by_node_id(constructor.id())
                 .expect("Constructor should be defined");
 
-            let mut ssa_cfg = SsaCfg::new(constructor_id);
+            let mut ssa_cfg = SsaCfg::new("constructor".to_string(), constructor_id);
 
             constructor.params.iter().for_each(|param| {
                 ssa_cfg.add_param(
@@ -128,37 +107,43 @@ impl SsaBuilder {
             None
         };
 
-        Ok(SsaContractInit {
-            name: init.name.clone(),
-            states: init.states.clone(),
-            variables: init.variables.clone(),
-            constants: init.constants.clone(),
-            constructor: constructor_cfg,
-        })
-    }
-
-    fn build_state_def(&mut self, state_def: &StateDef) -> Result<SsaStateDef, MerakError> {
-        let mut ssa_functions = vec![];
-        for function in &state_def.functions {
+        let mut functions = vec![];
+        for function in contract.functions.iter() {
             let ssa_function = self.build_function(function)?;
-            ssa_functions.push(ssa_function);
+            functions.push(ssa_function);
         }
 
-        Ok(SsaStateDef {
-            contract: state_def.contract.clone(),
-            name: state_def.name.clone(),
-            owner: state_def.owner.clone(),
-            functions: ssa_functions,
-            source_ref: state_def.source_ref.clone(),
+        Ok(SsaContract {
+            name: contract.name.clone(),
+            variables: contract.variables.clone(),
+            constants: contract.constants.clone(),
+            constructor: constructor_cfg,
+            functions,
         })
     }
+
+    // fn build_state_def(&mut self, state_def: &StateDef) -> Result<SsaStateDef, MerakError> {
+    //     let mut ssa_functions = vec![];
+    //     for function in &state_def.functions {
+    //         let ssa_function = self.build_function(function)?;
+    //         ssa_functions.push(ssa_function);
+    //     }
+
+    //     Ok(SsaStateDef {
+    //         contract: state_def.contract.clone(),
+    //         name: state_def.name.clone(),
+    //         owner: state_def.owner.clone(),
+    //         functions: ssa_functions,
+    //         source_ref: state_def.source_ref.clone(),
+    //     })
+    // }
 
     fn build_function(&mut self, function: &Function) -> Result<SsaCfg, MerakError> {
         let function_id = self
             .symbol_table
             .get_symbol_id_by_node_id(function.id())
             .expect("Function should be defined");
-        let mut ssa_cfg = SsaCfg::new(function_id);
+        let mut ssa_cfg = SsaCfg::new(function.name.clone(), function_id);
 
         function.params.iter().for_each(|param| {
             ssa_cfg.add_param(
@@ -208,7 +193,7 @@ impl SsaBuilder {
                 id: _,
                 source_ref,
             } => {
-                let header_bb = ssa_cfg.new_block();
+                let header_bb = self.current_block;
                 let then_bb = ssa_cfg.new_block();
                 let (else_bb, exit_bb) = if else_block.is_some() {
                     let else_bb = ssa_cfg.new_block();
@@ -219,10 +204,10 @@ impl SsaBuilder {
                     (exit_bb, exit_bb)
                 };
 
-                ssa_cfg
-                    .add_terminator_at(self.current_block, Terminator::Jump { target: header_bb });
-                ssa_cfg.add_edge(self.current_block, header_bb);
-                self.current_block = header_bb;
+                // ssa_cfg
+                //     .add_terminator_at(self.current_block, Terminator::Jump { target: header_bb });
+                // ssa_cfg.add_edge(self.current_block, header_bb);
+                //self.current_block = header_bb;
 
                 let cond_operand = self
                     .transform_expression(condition, ssa_cfg)
@@ -233,23 +218,31 @@ impl SsaBuilder {
                         condition: cond_operand,
                         then_block: then_bb,
                         else_block: else_bb,
+                        invariants: vec![], // empty for ifs, >= 1 for loops
+                        variants: vec![], // empty for ifs, >= 1 for loops
                         source_ref: source_ref.clone(),
                     },
                 );
 
                 ssa_cfg.add_edge(header_bb, then_bb);
+                ssa_cfg.add_edge(header_bb, else_bb);
+
                 self.current_block = then_bb;
 
                 self.transform_block(then_block, ssa_cfg)?;
-                ssa_cfg.add_terminator_at(then_bb, Terminator::Jump { target: exit_bb });
-                ssa_cfg.add_edge(then_bb, exit_bb);
+                ssa_cfg.add_edge(self.current_block, exit_bb);
+                if matches!(ssa_cfg.blocks.get(&self.current_block).unwrap().terminator, Terminator::Unreachable) {
+                    ssa_cfg.add_terminator_at(self.current_block, Terminator::Jump { target: exit_bb });
+                }
+                //ssa_cfg.add_terminator_at(then_bb, Terminator::Jump { target: exit_bb });
 
                 if let Some(else_block) = else_block {
-                    ssa_cfg.add_edge(header_bb, else_bb);
                     self.current_block = else_bb;
                     self.transform_block(else_block, ssa_cfg)?;
-                    ssa_cfg.add_terminator_at(else_bb, Terminator::Jump { target: exit_bb });
-                    ssa_cfg.add_edge(else_bb, exit_bb);
+                    ssa_cfg.add_edge(self.current_block, exit_bb);
+                    if matches!(ssa_cfg.blocks.get(&self.current_block).unwrap().terminator, Terminator::Unreachable) {
+                        ssa_cfg.add_terminator_at(self.current_block, Terminator::Jump { target: exit_bb });
+                    }
                 }
 
                 self.current_block = exit_bb;
@@ -284,11 +277,14 @@ impl SsaBuilder {
                         condition: cond_operand,
                         then_block: body_bb,
                         else_block: exit_bb,
+                        invariants: invariants.to_vec(),
+                        variants: variants.to_vec(),
                         source_ref: source_ref.clone(),
                     },
                 );
 
                 ssa_cfg.add_edge(header_bb, body_bb);
+                ssa_cfg.add_edge(body_bb, header_bb);
                 self.current_block = body_bb;
 
                 self.transform_block(body, ssa_cfg)?;
@@ -307,7 +303,7 @@ impl SsaBuilder {
                     source_ref: source_ref.clone(),
                 };
 
-                ssa_cfg.add_terminator(terminator);
+                ssa_cfg.add_terminator_at(self.current_block, terminator);
             }
             Statement::Assignment {
                 target: _,
@@ -322,7 +318,7 @@ impl SsaBuilder {
                 let symbol = self.symbol_table.get_symbol_id_by_node_id(*id).unwrap();
                 match symbol_info.kind {
                     SymbolKind::StateVar | SymbolKind::StateConst => {
-                        ssa_cfg.add_instruction(SsaInstruction::StorageStore {
+                        ssa_cfg.add_instruction_at(self.current_block, SsaInstruction::StorageStore {
                             var: symbol,
                             value,
                             source_ref: source_ref.clone(),
@@ -331,7 +327,7 @@ impl SsaBuilder {
                     SymbolKind::LocalVar | SymbolKind::Parameter => {
                         let dest = Register { symbol, version: 0 };
 
-                        ssa_cfg.add_instruction(SsaInstruction::Copy {
+                        ssa_cfg.add_instruction_at(self.current_block, SsaInstruction::Copy {
                             dest,
                             source: value,
                             source_ref: source_ref.clone(),
@@ -360,21 +356,9 @@ impl SsaBuilder {
                     .expect("variable initializer cannot be void");
                 let dest = Register { symbol, version: 0 };
 
-                ssa_cfg.add_instruction(SsaInstruction::Copy {
+                ssa_cfg.add_instruction_at(self.current_block, SsaInstruction::Copy {
                     dest,
                     source: value,
-                    source_ref: source_ref.clone(),
-                });
-            }
-            Statement::Become(_, node_id, source_ref) => {
-                println!("Become node id: {node_id:?}");
-                println!("Symbol table: {}", self.symbol_table);
-                let new_state = self
-                    .symbol_table
-                    .get_symbol_id_by_node_id(node_id.clone())
-                    .unwrap();
-                ssa_cfg.add_instruction(SsaInstruction::StateTransition {
-                    new_state,
                     source_ref: source_ref.clone(),
                 });
             }
@@ -403,6 +387,7 @@ impl SsaBuilder {
                 match symbol_info.kind {
                     SymbolKind::StateVar | SymbolKind::StateConst => {
                         let temp = self.new_temp_register();
+                        ssa_cfg.local_temps.insert(temp, symbol_info.ty.as_ref().expect("Deberia estar definido (Identifier State)").base.clone());
                         ssa_cfg.add_instruction_at(
                             self.current_block,
                             SsaInstruction::StorageLoad {
@@ -413,7 +398,7 @@ impl SsaBuilder {
                         );
                         Some(Operand::Register(temp))
                     }
-                    SymbolKind::LocalVar | SymbolKind::Parameter => {
+                    SymbolKind::LocalVar | SymbolKind::Parameter => { // TODO: LocalVar v = 0?
                         Some(Operand::Register(Register { symbol, version: 0 }))
                     }
                     _ => unreachable!("Invalid kind in assigment: {:?}", symbol_info.kind),
@@ -423,7 +408,7 @@ impl SsaBuilder {
                 left,
                 op,
                 right,
-                id: _,
+                id,
                 source_ref,
             } => {
                 let left_operand = self
@@ -433,6 +418,9 @@ impl SsaBuilder {
                     .transform_expression(right, ssa_cfg)
                     .expect("binary operation right operand cannot be void");
                 let target = self.new_temp_register();
+
+                let symbol_info = self.symbol_table.expr_to_type(*id).expect("Ya se cargo");
+                ssa_cfg.local_temps.insert(target, symbol_info.clone());
 
                 ssa_cfg.add_instruction_at(
                     self.current_block,
@@ -449,13 +437,15 @@ impl SsaBuilder {
             Expression::UnaryOp {
                 op,
                 expr,
-                id: _,
+                id,
                 source_ref,
             } => {
                 let operand = self
                     .transform_expression(expr, ssa_cfg)
                     .expect("unary operation operand cannot be void");
                 let target = self.new_temp_register();
+                let symbol_info = self.symbol_table.expr_to_type(*id).expect("Ya se cargo");
+                ssa_cfg.local_temps.insert(target, symbol_info.clone());
                 ssa_cfg.add_instruction_at(
                     self.current_block,
                     SsaInstruction::UnaryOp {
@@ -474,14 +464,13 @@ impl SsaBuilder {
                 id,
                 source_ref,
             } => {
+                let symbol_id = self.symbol_table.get_symbol_id_by_node_id(*id).unwrap();
                 let dest = match &self.symbol_table.get_symbol_by_node_id(*id).unwrap().kind {
                     SymbolKind::Function {
-                        state: _,
                         return_type,
                         ..
                     }
                     | SymbolKind::Entrypoint {
-                        state: _,
                         return_type,
                         ..
                     } => {
@@ -490,11 +479,18 @@ impl SsaBuilder {
                         {
                             None
                         } else {
-                            Some(self.new_temp_register())
+                            let target = self.new_temp_register();
+                            ssa_cfg.local_temps.insert(target, return_type.base.clone());
+                            Some(target)
                         }
                     }
-                    _ => {
-                        panic!("Function '{}' not found", name);
+                    SymbolKind::Contract => {
+                        let target = self.new_temp_register();
+                        ssa_cfg.local_temps.insert(target, BaseType::Contract(name.clone()));
+                        Some(target)
+                    }
+                    e => {
+                        panic!("Function '{}' not found. Kind: {}", name, e);
                     }
                 };
 
@@ -506,17 +502,11 @@ impl SsaBuilder {
                     args_operands.push(operand);
                 }
 
-                let target = self
-                    .symbol_table
-                    .get_symbol_by_node_id(*id)
-                    .map(|info| self.name_to_target(info.qualified_name.clone()))
-                    .unwrap_or_else(|| panic!("Function '{}' not found", name));
-
                 ssa_cfg.add_instruction_at(
                     self.current_block,
                     SsaInstruction::Call {
                         dest,
-                        target,
+                        target: CallTarget::Internal(symbol_id),
                         args: args_operands,
                         source_ref: source_ref.clone(),
                     },
@@ -524,360 +514,61 @@ impl SsaBuilder {
 
                 dest.map(Operand::Register)
             }
-        }
-    }
+            Expression::MemberCall { 
+                object, 
+                method: _, 
+                args, 
+                id, 
+                source_ref 
+            } => {
 
-    fn name_to_target(&self, qualified_name: QualifiedName) -> CallTarget {
-        use merak_symbols::SymbolNamespace;
-
-        let last = qualified_name.parts.last().unwrap();
-
-        if last.contains('.') {
-            let parts: Vec<&str> = last.split('.').collect();
-            let contract_name = parts[0];
-            let function_name = parts[1];
-
-            let contract_id = self
-                .symbol_table
-                .lookup(contract_name, SymbolNamespace::Type)
-                .unwrap_or_else(|| panic!("Contract '{}' not found", contract_name));
-
-            let function_id = self
-                .symbol_table
-                .lookup(function_name, SymbolNamespace::Callable)
-                .unwrap_or_else(|| {
-                    panic!(
-                        "Function '{}' not found in contract '{}'",
-                        function_name, contract_name
-                    )
-                });
-
-            CallTarget::External {
-                contract: contract_id,
-                function: function_id,
+                let object_operand = self
+                    .transform_expression(object, ssa_cfg)
+                    .expect("member call object cannot be void");
+                
+                let mut args_operands = vec![];
+                for arg in args {
+                    let operand = self
+                        .transform_expression(arg, ssa_cfg)
+                        .expect("external call argument cannot be void");
+                    args_operands.push(operand);
+                }
+                
+                let method_symbol = self.symbol_table
+                    .get_symbol_id_by_node_id(*id)
+                    .expect("Method should be resolved in type checking");
+                let symbol_info = self.symbol_table.get_symbol_by_node_id(*id).unwrap();
+                
+                let dest = match &symbol_info.kind {
+                    SymbolKind::Function { return_type, .. } 
+                    | SymbolKind::Entrypoint { return_type, .. } => {
+                        if matches!(return_type.base, BaseType::Tuple { ref elems } if elems.is_empty()) {
+                            None
+                        } else {
+                            let target = self.new_temp_register();
+                            ssa_cfg.local_temps.insert(target, return_type.base.clone());
+                            Some(target)
+                        }
+                    }
+                    _ => panic!("MemberCall method resolved to non-function: {:?}", symbol_info.kind),
+                };
+                
+                ssa_cfg.add_instruction_at(
+                    self.current_block,
+                    SsaInstruction::Call {
+                        dest,
+                        target: CallTarget::External {
+                            object: object_operand,
+                            method: method_symbol,
+                        },
+                        args: args_operands,
+                        source_ref: source_ref.clone(),
+                    },
+                );
+                
+                dest.map(Operand::Register)
             }
-        } else {
-            let function_id = self
-                .symbol_table
-                .lookup(last, SymbolNamespace::Callable)
-                .unwrap_or_else(|| panic!("Function '{}' not found", last));
-
-            CallTarget::Internal(function_id)
         }
     }
 
-    // fn transform_refinement_expr(
-    //     &self,
-    //     expr: &RefinementExpr,
-    //     ssa_cfg: &mut SsaCfg,
-    // ) -> Option<Operand> {
-    //     match expr {
-    //         // Literals
-    //         RefinementExpr::IntLit(val, _, _) => Some(Operand::Constant(Constant::Int(*val))),
-    //         RefinementExpr::AddressLit(addr, _, _) => {
-    //             // TODO: Parse address string to H256
-    //             todo!("Parse address literal string '{}' to H256 constant", addr)
-    //         }
-
-    //         // Variables
-    //         RefinementExpr::Var(_, node_id, source_ref) => {
-    //             let symbol_info = self.symbol_table.get_symbol_by_node_id(*node_id).unwrap();
-    //             let symbol = self
-    //                 .symbol_table
-    //                 .get_symbol_id_by_node_id(*node_id)
-    //                 .unwrap();
-    //             match symbol_info.kind {
-    //                 SymbolKind::StateVar | SymbolKind::StateConst => {
-    //                     let temp = self.new_temp_register();
-    //                     ssa_cfg.add_instruction_at(
-    //                         self.current_block,
-    //                         SsaInstruction::StorageLoad {
-    //                             dest: temp,
-    //                             var: symbol,
-    //                             source_ref: source_ref.clone(),
-    //                         },
-    //                     );
-    //                     Some(Operand::Register(temp))
-    //                 }
-    //                 SymbolKind::LocalVar | SymbolKind::Parameter => {
-    //                     Some(Operand::Register(Register { symbol, version: 0 }))
-    //                 }
-    //                 _ => unreachable!("Invalid kind in refinement var: {:?}", symbol_info.kind),
-    //             }
-    //         }
-
-    //         // Binary operations (arithmetic)
-    //         RefinementExpr::BinOp {
-    //             op,
-    //             lhs,
-    //             rhs,
-    //             id: _,
-    //             source_ref,
-    //         } => {
-    //             let left_operand = self
-    //                 .transform_refinement_expr(lhs, ssa_cfg)
-    //                 .expect("refinement binary op left operand cannot be void");
-    //             let right_operand = self
-    //                 .transform_refinement_expr(rhs, ssa_cfg)
-    //                 .expect("refinement binary op right operand cannot be void");
-    //             let target = self.new_temp_register();
-
-    //             // Map ArithOp to BinaryOperator
-    //             let binary_op = match op {
-    //                 ArithOp::Add => BinaryOperator::Add,
-    //                 ArithOp::Sub => BinaryOperator::Subtract,
-    //                 ArithOp::Mul => BinaryOperator::Multiply,
-    //                 ArithOp::Div => BinaryOperator::Divide,
-    //                 ArithOp::Mod => BinaryOperator::Modulo,
-    //             };
-
-    //             ssa_cfg.add_instruction_at(
-    //                 self.current_block,
-    //                 SsaInstruction::BinaryOp {
-    //                     left: left_operand,
-    //                     right: right_operand,
-    //                     op: binary_op,
-    //                     dest: target,
-    //                     source_ref: source_ref.clone(),
-    //                 },
-    //             );
-    //             Some(Operand::Register(target))
-    //         }
-
-    //         // Unary operations
-    //         RefinementExpr::UnaryOp {
-    //             op,
-    //             expr,
-    //             id: _,
-    //             source_ref,
-    //         } => {
-    //             let operand = self
-    //                 .transform_refinement_expr(expr, ssa_cfg)
-    //                 .expect("refinement unary op operand cannot be void");
-    //             let target = self.new_temp_register();
-
-    //             // Map UnaryOp to UnaryOperator
-    //             let unary_op = match op {
-    //                 UnaryOp::Negate => UnaryOperator::Negate,
-    //             };
-
-    //             ssa_cfg.add_instruction_at(
-    //                 self.current_block,
-    //                 SsaInstruction::UnaryOp {
-    //                     op: unary_op,
-    //                     operand,
-    //                     dest: target,
-    //                     source_ref: source_ref.clone(),
-    //                 },
-    //             );
-    //             Some(Operand::Register(target))
-    //         }
-
-    //         // Special variables
-    //         RefinementExpr::MsgSender(_, _) => {
-    //             todo!("Handle msg.sender as a special global variable or intrinsic")
-    //         }
-    //         RefinementExpr::MsgValue(_, _) => {
-    //             todo!("Handle msg.value as a special global variable or intrinsic")
-    //         }
-    //         RefinementExpr::BlockTimestamp(_, _) => {
-    //             todo!("Handle block.timestamp as a special global variable or intrinsic")
-    //         }
-
-    //         // Uninterpreted functions
-    //         RefinementExpr::UninterpFn {
-    //             name,
-    //             args,
-    //             id: _,
-    //             source_ref,
-    //         } => {
-    //             let _ = (name, args, source_ref);
-    //             todo!("Handle uninterpreted function calls in refinement expressions")
-    //         }
-    //     }
-    // }
-
-    // fn transform_predicate(&self, predicate: &Predicate, ssa_cfg: &mut SsaCfg) -> Option<Operand> {
-    //     match predicate {
-    //         // Boolean literals
-    //         Predicate::True(_, _) => Some(Operand::Constant(Constant::Bool(true))),
-    //         Predicate::False(_, _) => Some(Operand::Constant(Constant::Bool(false))),
-
-    //         // Boolean variables
-    //         Predicate::Var(_, node_id, source_ref) => {
-    //             let symbol_info = self.symbol_table.get_symbol_by_node_id(*node_id).unwrap();
-    //             let symbol = self
-    //                 .symbol_table
-    //                 .get_symbol_id_by_node_id(*node_id)
-    //                 .unwrap();
-    //             match symbol_info.kind {
-    //                 SymbolKind::StateVar | SymbolKind::StateConst => {
-    //                     let temp = self.new_temp_register();
-    //                     ssa_cfg.add_instruction_at(
-    //                         self.current_block,
-    //                         SsaInstruction::StorageLoad {
-    //                             dest: temp,
-    //                             var: symbol,
-    //                             source_ref: source_ref.clone(),
-    //                         },
-    //                     );
-    //                     Some(Operand::Register(temp))
-    //                 }
-    //                 SymbolKind::LocalVar | SymbolKind::Parameter => {
-    //                     Some(Operand::Register(Register { symbol, version: 0 }))
-    //                 }
-    //                 _ => unreachable!("Invalid kind in predicate var: {:?}", symbol_info.kind),
-    //             }
-    //         }
-
-    //         // Binary relations (comparisons)
-    //         Predicate::BinRel {
-    //             op,
-    //             lhs,
-    //             rhs,
-    //             id: _,
-    //             source_ref,
-    //         } => {
-    //             let left_operand = self
-    //                 .transform_refinement_expr(lhs, ssa_cfg)
-    //                 .expect("predicate binary relation left operand cannot be void");
-    //             let right_operand = self
-    //                 .transform_refinement_expr(rhs, ssa_cfg)
-    //                 .expect("predicate binary relation right operand cannot be void");
-    //             let target = self.new_temp_register();
-
-    //             // Map RelOp to BinaryOperator
-    //             let binary_op = match op {
-    //                 RelOp::Eq => BinaryOperator::Equal,
-    //                 RelOp::Neq => BinaryOperator::NotEqual,
-    //                 RelOp::Lt => BinaryOperator::Less,
-    //                 RelOp::Leq => BinaryOperator::LessEqual,
-    //                 RelOp::Gt => BinaryOperator::Greater,
-    //                 RelOp::Geq => BinaryOperator::GreaterEqual,
-    //             };
-
-    //             ssa_cfg.add_instruction_at(
-    //                 self.current_block,
-    //                 SsaInstruction::BinaryOp {
-    //                     left: left_operand,
-    //                     right: right_operand,
-    //                     op: binary_op,
-    //                     dest: target,
-    //                     source_ref: source_ref.clone(),
-    //                 },
-    //             );
-    //             Some(Operand::Register(target))
-    //         }
-
-    //         // Logical operations
-    //         Predicate::And(left, right, _, source_ref) => {
-    //             let left_operand = self
-    //                 .transform_predicate(left, ssa_cfg)
-    //                 .expect("predicate AND left operand cannot be void");
-    //             let right_operand = self
-    //                 .transform_predicate(right, ssa_cfg)
-    //                 .expect("predicate AND right operand cannot be void");
-    //             let target = self.new_temp_register();
-
-    //             ssa_cfg.add_instruction_at(
-    //                 self.current_block,
-    //                 SsaInstruction::BinaryOp {
-    //                     left: left_operand,
-    //                     right: right_operand,
-    //                     op: BinaryOperator::LogicalAnd,
-    //                     dest: target,
-    //                     source_ref: source_ref.clone(),
-    //                 },
-    //             );
-    //             Some(Operand::Register(target))
-    //         }
-
-    //         Predicate::Or(left, right, _, source_ref) => {
-    //             let left_operand = self
-    //                 .transform_predicate(left, ssa_cfg)
-    //                 .expect("predicate OR left operand cannot be void");
-    //             let right_operand = self
-    //                 .transform_predicate(right, ssa_cfg)
-    //                 .expect("predicate OR right operand cannot be void");
-    //             let target = self.new_temp_register();
-
-    //             ssa_cfg.add_instruction_at(
-    //                 self.current_block,
-    //                 SsaInstruction::BinaryOp {
-    //                     left: left_operand,
-    //                     right: right_operand,
-    //                     op: BinaryOperator::LogicalOr,
-    //                     dest: target,
-    //                     source_ref: source_ref.clone(),
-    //                 },
-    //             );
-    //             Some(Operand::Register(target))
-    //         }
-
-    //         Predicate::Not(pred, _, source_ref) => {
-    //             let operand = self
-    //                 .transform_predicate(pred, ssa_cfg)
-    //                 .expect("predicate NOT operand cannot be void");
-    //             let target = self.new_temp_register();
-
-    //             ssa_cfg.add_instruction_at(
-    //                 self.current_block,
-    //                 SsaInstruction::UnaryOp {
-    //                     op: UnaryOperator::Not,
-    //                     operand,
-    //                     dest: target,
-    //                     source_ref: source_ref.clone(),
-    //                 },
-    //             );
-    //             Some(Operand::Register(target))
-    //         }
-
-    //         // Implication: a ==> b is equivalent to !a || b
-    //         Predicate::Implies(left, right, _, source_ref) => {
-    //             let left_operand = self
-    //                 .transform_predicate(left, ssa_cfg)
-    //                 .expect("predicate IMPLIES left operand cannot be void");
-    //             let right_operand = self
-    //                 .transform_predicate(right, ssa_cfg)
-    //                 .expect("predicate IMPLIES right operand cannot be void");
-
-    //             // Generate !left
-    //             let not_left = self.new_temp_register();
-    //             ssa_cfg.add_instruction_at(
-    //                 self.current_block,
-    //                 SsaInstruction::UnaryOp {
-    //                     op: UnaryOperator::Not,
-    //                     operand: left_operand,
-    //                     dest: not_left,
-    //                     source_ref: source_ref.clone(),
-    //                 },
-    //             );
-
-    //             // Generate !left || right
-    //             let target = self.new_temp_register();
-    //             ssa_cfg.add_instruction_at(
-    //                 self.current_block,
-    //                 SsaInstruction::BinaryOp {
-    //                     left: Operand::Register(not_left),
-    //                     right: right_operand,
-    //                     op: BinaryOperator::LogicalOr,
-    //                     dest: target,
-    //                     source_ref: source_ref.clone(),
-    //                 },
-    //             );
-    //             Some(Operand::Register(target))
-    //         }
-
-    //         // Uninterpreted function calls
-    //         Predicate::UninterpFnCall {
-    //             name,
-    //             args,
-    //             id: _,
-    //             source_ref,
-    //         } => {
-    //             let _ = (name, args, source_ref);
-    //             todo!("Handle uninterpreted function calls in predicates")
-    //         }
-    //     }
-    // }
 }

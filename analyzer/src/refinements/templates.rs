@@ -69,38 +69,43 @@ pub enum Template {
         refinement: Predicate,
         source_ref: SourceRef,
     },
-
-    /// Explicitly no refinement - no inference, no verification
-    Unrefined {
-        base: BaseType,
-        source_ref: SourceRef,
-    },
 }
 
 impl Template {
-    /// For symbol table lookups - assumes True means "infer", can't return unrefined templates
+        /// For symbol table lookups - assumes True means "infer", can't return unrefined templates
     pub fn from_type(ty: &Type, liquid_gen: &mut LiquidVarGenerator) -> Self {
-        if matches!(ty.constraint, Predicate::True(_, _)) {
-            // Default: True in symbol table = needs inference
-            Template::Liquid {
-                base: ty.base.clone(),
-                binder: ty.binder.clone(),
-                liquid_var: liquid_gen.fresh(),
-                source_ref: ty.source_ref.clone(),
-            }
-        } else {
+        if ty.is_explicit_annotation() {
             Template::Concrete {
                 base: ty.base.clone(),
                 binder: ty.binder.clone(),
                 refinement: ty.constraint.clone(),
                 source_ref: ty.source_ref.clone(),
             }
+        } else {
+            Template::Liquid {
+                base: ty.base.clone(),
+                binder: ty.binder.clone(),
+                liquid_var: liquid_gen.fresh(),
+                source_ref: ty.source_ref.clone(),
+            }
+            
         }
     }
 
-    /// Create unrefined template directly (useful to point storage invalidations)
-    pub fn unrefined(base: BaseType, source_ref: SourceRef) -> Self {
-        Template::Unrefined { base, source_ref }
+    pub fn replace_binder(&mut self, new_binder: &str) {
+        match self {
+            Template::Concrete { binder, refinement, .. } => {
+                let mut subst = HashMap::new();
+                subst.insert(binder.clone(), new_binder.to_string());
+
+                *refinement = refinement.substitute_vars(&subst);
+
+                *binder = new_binder.to_string();
+            },
+            Template::Liquid { binder, .. } => {
+                *binder = new_binder.to_string();
+            },
+        };
     }
 
     /// Create liquid template directly (useful for intermediate expressions)
@@ -133,19 +138,11 @@ impl Template {
         }
     }
 
-    pub fn to_unrefined(&self) -> Template {
-        Template::Unrefined {
-            base: self.base_type().clone(),
-            source_ref: self.source_ref().clone(),
-        }
-    }
-
     /// Get the base type
     pub fn base_type(&self) -> &BaseType {
         match self {
             Template::Liquid { base, .. } => base,
             Template::Concrete { base, .. } => base,
-            Template::Unrefined { base, .. } => base,
         }
     }
 
@@ -154,7 +151,6 @@ impl Template {
         match self {
             Template::Liquid { binder, .. } => binder,
             Template::Concrete { binder, .. } => binder,
-            Template::Unrefined { .. } => "v", // TODO: Check binders
         }
     }
 
@@ -163,7 +159,6 @@ impl Template {
         match self {
             Template::Liquid { source_ref, .. } => source_ref,
             Template::Concrete { source_ref, .. } => source_ref,
-            Template::Unrefined { source_ref, .. } => source_ref,
         }
     }
 
@@ -181,7 +176,7 @@ impl Template {
     pub fn liquid_var(&self) -> Option<LiquidVar> {
         match self {
             Template::Liquid { liquid_var, .. } => Some(*liquid_var),
-            Template::Concrete { .. } | Template::Unrefined { .. } => None,
+            Template::Concrete { .. }  => None,
         }
     }
 
@@ -189,60 +184,49 @@ impl Template {
     pub fn refinement(&self) -> Option<&Predicate> {
         match self {
             Template::Concrete { refinement, .. } => Some(refinement),
-            Template::Liquid { .. } | Template::Unrefined { .. } => None,
+            Template::Liquid { .. }  => None,
         }
     }
 
-    /// Convert to Type by applying a liquid variable assignment
-    ///
-    /// - Liquid: Uses assignment from solver (warns if missing)
-    /// - Concrete: Uses its known refinement
-    /// - Unrefined: Intentionally produces Predicate::True (no refinement)
-    pub fn to_type(&self, assignment: &LiquidAssignment) -> Type {
-        match self {
-            Template::Liquid {
-                base,
-                binder,
-                liquid_var,
-                source_ref,
-            } => {
-                let refinement = assignment.get(*liquid_var).cloned().unwrap_or_else(|| {
-                    // This SHOULDN'T happen - means inference failed
-                    eprintln!("Warning: No assignment for {}, using True", liquid_var);
-                    Predicate::True(NodeId::new(0), source_ref.clone())
-                });
-                Type {
-                    base: base.clone(),
-                    binder: binder.clone(),
-                    constraint: refinement,
-                    source_ref: source_ref.clone(),
-                }
-            }
+    // / Convert to Type by applying a liquid variable assignment
+    // /
+    // / - Liquid: Uses assignment from solver (warns if missing)
+    // / - Concrete: Uses its known refinement
+    // / - Unrefined: Intentionally produces Predicate::True (no refinement)
+    // pub fn to_type(&self, assignment: &LiquidAssignment) -> Type {
+    //     match self {
+    //         Template::Liquid {
+    //             base,
+    //             binder,
+    //             liquid_var,
+    //             source_ref,
+    //         } => {
+    //             let refinement = assignment.get(*liquid_var).cloned().unwrap_or_else(|| {
+    //                 // This SHOULDN'T happen - means inference failed
+    //                 eprintln!("Warning: No assignment for {}, using True", liquid_var);
+    //                 Predicate::True(NodeId::new(0), source_ref.clone())
+    //             });
+    //             Type {
+    //                 base: base.clone(),
+    //                 binder: binder.clone(),
+    //                 constraint: refinement,
+    //                 source_ref: source_ref.clone(),
+    //             }
+    //         }
 
-            Template::Concrete {
-                base,
-                binder,
-                refinement,
-                source_ref,
-            } => Type {
-                base: base.clone(),
-                binder: binder.clone(),
-                constraint: refinement.clone(),
-                source_ref: source_ref.clone(),
-            },
-
-            Template::Unrefined { base, source_ref } => {
-                // Unrefined INTENTIONALLY becomes Predicate::True
-                // This is NOT an error - it's the expected behavior
-                Type {
-                    base: base.clone(),
-                    binder: "_".to_string(), // No binder needed
-                    constraint: Predicate::True(NodeId::new(0), source_ref.clone()),
-                    source_ref: source_ref.clone(),
-                }
-            }
-        }
-    }
+    //         Template::Concrete {
+    //             base,
+    //             binder,
+    //             refinement,
+    //             source_ref,
+    //         } => Type {
+    //             base: base.clone(),
+    //             binder: binder.clone(),
+    //             constraint: refinement.clone(),
+    //             source_ref: source_ref.clone(),
+    //         },
+    //     }
+    // }
 }
 
 impl fmt::Display for Template {
@@ -271,9 +255,6 @@ impl fmt::Display for Template {
                 } else {
                     write!(f, "{{{}: {:?} | {:?}}}", binder, base, refinement)
                 }
-            }
-            Template::Unrefined { base, source_ref } => {
-                write!(f, "{{{:?} | True}}", base)
             }
         }
     }

@@ -11,9 +11,10 @@ use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
 use indexmap::IndexMap;
+use merak_ast::contract::InterfaceDecl;
 use merak_ast::predicate::{Predicate, RefinementExpr};
+use merak_ast::types::{BaseType, Type};
 use merak_ast::{
-    contract::Owner,
     expression::{BinaryOperator, Expression, UnaryOperator},
     meta::SourceRef,
     statement::{StateConst, StateVar},
@@ -27,6 +28,15 @@ use primitive_types::H256;
 pub enum Operand {
     Register(Register),
     Constant(Constant),
+}
+
+impl Operand {
+    pub fn symbol_id(&self) -> Option<SymbolId> {
+        match self {
+            Operand::Register(r) => Some(r.symbol),
+            Operand::Constant(_) => None,
+        }
+    }
 }
 
 /// SSA-versioned register
@@ -124,14 +134,23 @@ pub enum SsaInstruction {
     },
 
     // ------------------------------------------------------------------------
-    // STATE MACHINE
+    // STORAGE ANALYSIS
     // ------------------------------------------------------------------------
-    /// State transition: become NewState
-    /// Changes the contract's current state, affecting which functions are callable
-    StateTransition {
-        new_state: StateId,
+    // Unfold storage abstraction (transition: Folded → Unfolded)
+    /// Semantics: Assume invariant is valid, expose concrete value
+    Unfold {
+        var: SymbolId,
         source_ref: SourceRef,
     },
+    
+    /// Fold storage abstraction (transition: Unfolded → Folded)
+    /// Semantics: Verify invariant still holds, close abstraction
+    Fold {
+        var: SymbolId,
+        source_ref: SourceRef,
+    },
+
+
 
     // ------------------------------------------------------------------------
     // VERIFICATION & ASSERTIONS
@@ -200,7 +219,7 @@ impl SsaInstruction {
             SsaInstruction::Call { dest, .. } => *dest,
 
             SsaInstruction::StorageStore { .. }
-            | SsaInstruction::StateTransition { .. }
+            | SsaInstruction::Fold { .. } | SsaInstruction::Unfold { .. }
             | SsaInstruction::Assert { .. } => None,
         }
     }
@@ -216,16 +235,10 @@ pub enum CallTarget {
     Internal(SymbolId),
 
     /// Function in an imported contract
-    /// Example: "import AuxFunc from auxfunc" -> External { contract: auxfunc_id, ... }
     External {
-        contract: ContractId,
-        function: SymbolId,
+        object: Operand,          
+        method: SymbolId,          // La función específica en esa interface/contrato
     },
-    // TODO: Dynamic calls (address computed at runtime)
-    // Dynamic {
-    //     contract: Register,  // Address computed dynamically
-    //     function: String,
-    // },
 }
 
 // ============================================================================
@@ -283,6 +296,8 @@ pub enum Terminator {
         condition: Operand,
         then_block: BlockId,
         else_block: BlockId,
+        invariants: Vec<Predicate>, // empty for ifs, >= 1 for loops
+        variants: Vec<RefinementExpr>, // empty for ifs, >= 1 for loops
         source_ref: SourceRef,
     },
 
@@ -324,10 +339,10 @@ pub struct BasicBlock {
 // ============================================================================
 
 pub struct SsaCfg {
+    pub name: String,
     pub function_id: SymbolId,
     pub blocks: HashMap<BlockId, BasicBlock>,
     pub entry: BlockId,
-    pub exit: Option<BlockId>, // None if function never returns
     pub next_id: usize,
 
     // Function parameters (live-in at entry)
@@ -346,26 +361,29 @@ pub struct SsaCfg {
     /// Loop information (computed after dominance analysis)
     pub loops: Option<LoopForest>,
 
+    pub local_temps: HashMap<Register, BaseType>,
+
     /// Cached reverse post-order traversal
     rpo_cache: OnceLock<Vec<BlockId>>,
 
     /// Cached RPO indices for fast dominance computation
-    rpo_indices_cache: OnceLock<HashMap<BlockId, usize>>,
+    rpo_indices_cache: OnceLock<HashMap<BlockId, usize>>,    
 }
 
 impl SsaCfg {
-    pub fn new(function_id: SymbolId) -> Self {
+    pub fn new(name: String, function_id: SymbolId) -> Self {
         Self {
+            name,
             function_id,
             blocks: HashMap::new(),
             entry: 0,
-            exit: None,
             next_id: 0,
             parameters: Vec::new(),
             requires: Vec::new(),
             ensures: Vec::new(),
             dominance: None,
             loops: None,
+            local_temps: HashMap::new(),
             rpo_cache: OnceLock::new(),
             rpo_indices_cache: OnceLock::new(),
         }
@@ -429,6 +447,10 @@ impl SsaCfg {
 
     pub fn add_param(&mut self, param: SymbolId) {
         self.parameters.push(param);
+    }
+
+    pub fn exit_blocks(&self) -> Vec<BlockId> {
+        self.blocks.keys().copied().filter(|id| matches!(self.blocks[id].terminator, Terminator::Return{..})).collect()
     }
 
     pub fn reverse_post_order(&self) -> &Vec<BlockId> {
@@ -799,8 +821,7 @@ impl SsaCfg {
                                 .push(*block_id);
                         }
                     }
-                    SsaInstruction::StateTransition { .. } => {}
-                    SsaInstruction::Assert { .. } => {}
+                    SsaInstruction::Fold { .. } | SsaInstruction::Unfold { .. } | SsaInstruction::Assert { .. } => {}
                 };
             }
         }
@@ -870,7 +891,7 @@ impl SsaCfg {
         let mut definitions_made: Vec<(SymbolId, usize)> = Vec::new();
 
         self.process_phi_nodes(block_id, ctx, &mut definitions_made);
-        self.process_instructions(block_id, ctx, &mut definitions_made);
+        self.process_instructions_and_terminators(block_id, ctx, &mut definitions_made);
         self.fill_successor_phis(block_id, ctx);
 
         let children = self
@@ -921,7 +942,7 @@ impl SsaCfg {
         }
     }
 
-    fn process_instructions(
+    fn process_instructions_and_terminators(
         &mut self,
         block_id: usize,
         ctx: &mut RenamingContext,
@@ -961,10 +982,15 @@ impl SsaCfg {
                 }
                 SsaInstruction::Phi { .. }
                 | SsaInstruction::StorageStore { .. }
-                | SsaInstruction::StateTransition { .. }
+                | SsaInstruction::Fold { .. }
+                | SsaInstruction::Unfold { .. }
                 | SsaInstruction::Assert { .. } => {}
             }
         }
+
+        // Rename the terminator's operands
+        let block = self.blocks.get_mut(&block_id).expect("Block not found");
+        Self::rename_terminator_operands(&mut block.terminator, ctx);
     }
 
     fn rename_instruction_operands(inst: &mut SsaInstruction, ctx: &RenamingContext) {
@@ -993,7 +1019,8 @@ impl SsaCfg {
             // These don't have operands or already processed
             SsaInstruction::Phi { .. }
             | SsaInstruction::StorageLoad { .. }
-            | SsaInstruction::StateTransition { .. } => {}
+            | SsaInstruction::Fold { .. }
+            | SsaInstruction::Unfold { .. } => {}
         }
     }
 
@@ -1004,6 +1031,22 @@ impl SsaCfg {
                 .top(reg.symbol)
                 .expect(&format!("Variable {:?} used before definition", reg.symbol));
             reg.version = version;
+        }
+    }
+
+    fn rename_terminator_operands(terminator: &mut Terminator, ctx: &RenamingContext) {
+        match terminator {
+            Terminator::Branch { condition, .. } => {
+                Self::rename_operand(condition, ctx);
+            }
+            Terminator::Return { value, .. } => {
+                if let Some(operand) = value {
+                    Self::rename_operand(operand, ctx);
+                }
+            }
+            Terminator::Jump { .. } | Terminator::Unreachable => {
+            
+            }
         }
     }
 
@@ -1186,8 +1229,11 @@ impl std::fmt::Debug for SsaInstruction {
                 }
                 write!(f, ")")
             }
-            Self::StateTransition { new_state, .. } => {
-                write!(f, "become state[{:?}]", new_state)
+            Self::Fold { var, .. } => {
+                write!(f, "fold {:?}", var)
+            },
+            Self::Unfold { var, .. } => {
+                write!(f, "unfold {:?}", var)
             }
             Self::Assert {
                 condition, kind, ..
@@ -1243,10 +1289,18 @@ impl std::fmt::Debug for SsaCfg {
         writeln!(f, "SsaCfg {{")?;
         writeln!(f, "  entry: bb{}", self.entry)?;
 
-        if let Some(exit) = self.exit {
-            writeln!(f, "  exit: bb{}", exit)?;
+        let exits = self.exit_blocks();
+        if exits.is_empty() {
+            writeln!(f, "  exit: []")?;
         } else {
-            writeln!(f, "  exit: None")?;
+            write!(f, "  exit: [")?;
+            for (i, exit) in exits.iter().enumerate() {
+                if i > 0 {
+                    write!(f, ", ")?;
+                }
+                write!(f, "bb{}", exit)?;
+            }
+            writeln!(f, "]")?;
         }
 
         if !self.parameters.is_empty() {
@@ -1283,31 +1337,32 @@ impl std::fmt::Debug for SsaCfg {
 // Program
 // ============================================================================
 
+#[derive(Debug)]
 pub struct SsaProgram {
-    pub contracts: IndexMap<String, SsaContract>,
+    pub files: IndexMap<String, SsaFile>,
+}
+
+#[derive(Debug)]
+pub struct SsaFile {
+    pub imports: Vec<Import>,
+    pub interfaces: Vec<InterfaceDecl>,
+    pub contract: SsaContract,
 }
 
 #[derive(Debug)]
 pub struct SsaContract {
-    pub imports: Vec<Import>,
-    pub data: SsaContractInit,
-    pub state_defs: Vec<(String, SsaStateDef)>,
-}
-
-#[derive(Debug)]
-pub struct SsaContractInit {
     pub name: String,
-    pub states: Vec<String>,
     pub variables: Vec<StateVar>,
     pub constants: Vec<StateConst>,
     pub constructor: Option<SsaCfg>,
+    pub functions: Vec<SsaCfg>
 }
 
-#[derive(Debug)]
-pub struct SsaStateDef {
-    pub contract: String,
-    pub name: String,
-    pub owner: Owner,
-    pub functions: Vec<SsaCfg>,
-    pub source_ref: SourceRef,
-}
+// #[derive(Debug)]
+// pub struct SsaStateDef {
+//     pub contract: String,
+//     pub name: String,
+//     pub owner: Owner,
+//     pub functions: Vec<SsaCfg>,
+//     pub source_ref: SourceRef,
+// }

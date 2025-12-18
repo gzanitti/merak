@@ -3,8 +3,9 @@ use std::fmt;
 use merak_ast::{
     expression::{BinaryOperator, UnaryOperator},
     meta::SourceRef,
-    predicate::Predicate,
+    predicate::{Predicate, RefinementExpr},
 };
+use merak_symbols::SymbolId;
 
 use crate::refinements::templates::Template;
 
@@ -32,8 +33,8 @@ pub enum Constraint {
     /// Core constraint: τ₁ <: τ₂ iff ∀x. P₁(x) ⇒ P₂(x)
     Subtype {
         context: TypeContext,
-        lhs: Template,
-        rhs: Template,
+        sub: Template,
+        sup: Template,
         location: SourceRef,
     },
 
@@ -70,6 +71,18 @@ pub enum Constraint {
         location: SourceRef,
     },
 
+    /// Precondition: caller must establish this predicate
+    ///
+    /// Γ ⊢ P  (at call site)
+    ///
+    /// Requires clause verification: before calling a function,
+    /// the precondition P must be provable from the current context
+    Requires {
+        context: TypeContext,
+        condition: Predicate,
+        location: SourceRef,
+    },
+
     /// Postcondition: a predicate must hold at function exit
     ///
     /// Γ ⊢ P
@@ -82,48 +95,68 @@ pub enum Constraint {
         condition: Predicate,
         location: SourceRef,
     },
+
+    // Loop invariant must hold at loop entry
+    /// Γ ⊢ I
+    LoopInvariantEntry {
+        context: TypeContext,
+        invariant: Predicate,
+        location: SourceRef,
+    },
+    
+    /// Loop invariant must be preserved by loop body
+    /// Γ, I ⊢ body ⇒ I
+    LoopInvariantPreservation {
+        context: TypeContext,
+        invariant: Predicate,
+        location: SourceRef,
+    },
+    
+    /// Loop variant must be non-negative
+    /// Γ ⊢ V ≥ 0
+    LoopVariantNonNegative {
+        context: TypeContext,
+        variant: RefinementExpr,
+        location: SourceRef,
+    },
+    
+    /// Loop variant must decrease
+    /// Γ, V = v_old ⊢ V < v_old
+    LoopVariantDecreases {
+        entry_context: TypeContext,
+        preservation_context: TypeContext,
+        variant: RefinementExpr,
+        location: SourceRef,
+    },
+
+    /// Fold: verify storage invariant
+    ///
+    /// Γ ⊢ fold(var) : assert(refinement(var))
+    ///
+    /// At fold point, must prove that the storage variable
+    /// satisfies its declared refinement
+    Fold {
+        context: TypeContext,
+        var: SymbolId,           // Storage variable
+        refinement: Predicate,   // Its declared refinement
+        location: SourceRef,
+    },
+
+    // /// Unfold: assume storage invariant
+    // ///
+    // /// Γ ⊢ unfold(var) : assume(refinement(var))
+    // ///
+    // /// At unfold point, add the storage variable's refinement
+    // /// as an assumption (it was verified at last fold)
+    // Unfold {
+    //     context: TypeContext,
+    //     var: SymbolId,           // Storage variable
+    //     refinement: Predicate,   // Its declared refinement
+    //     location: SourceRef,
+    // },
 }
 
 impl Constraint {
-    /// Create a well-formedness constraint
-    pub fn well_formed(context: TypeContext, template: Template, location: SourceRef) -> Self {
-        Constraint::WellFormed {
-            context,
-            template,
-            location,
-        }
-    }
-
-    /// Create a subtyping constraint
-    pub fn subtype(
-        context: TypeContext,
-        lhs: Template,
-        rhs: Template,
-        location: SourceRef,
-    ) -> Self {
-        Constraint::Subtype {
-            context,
-            lhs,
-            rhs,
-            location,
-        }
-    }
-
-    /// Create a guard constraint
-    // pub fn guard(
-    //     context: TypeContext,
-    //     condition: Predicate,
-    //     then_constraints: Vec<Constraint>,
-    //     location: SourceRef,
-    // ) -> Self {
-    //     Constraint::Guard {
-    //         context,
-    //         condition,
-    //         then_constraints,
-    //         location,
-    //     }
-    // }
-
     /// Get the location of this constraint
     pub fn location(&self) -> &SourceRef {
         match self {
@@ -131,7 +164,13 @@ impl Constraint {
             Constraint::Subtype { location, .. } => location,
             Constraint::BinaryOp { location, .. } => location,
             Constraint::UnaryOp { location, .. } => location,
+            Constraint::Requires { location, .. } => location,
             Constraint::Ensures { location, .. } => location,
+            Constraint::LoopInvariantEntry { location, .. } => location,
+            Constraint::LoopInvariantPreservation { location, .. } => location,
+            Constraint::LoopVariantNonNegative { location, .. } => location,
+            Constraint::LoopVariantDecreases { location, .. } => location,
+            Constraint::Fold { location, .. } => location,
         }
     }
 
@@ -142,7 +181,13 @@ impl Constraint {
             Constraint::Subtype { context, .. } => context,
             Constraint::BinaryOp { context, .. } => context,
             Constraint::UnaryOp { context, .. } => context,
+            Constraint::Requires { context, .. } => context,
             Constraint::Ensures { context, .. } => context,
+            Constraint::LoopInvariantEntry { context, .. } => context,
+            Constraint::LoopInvariantPreservation { context, .. } => context,
+            Constraint::LoopVariantNonNegative { context, .. } => context,
+            Constraint::LoopVariantDecreases { entry_context, .. } => entry_context,
+            Constraint::Fold { context, .. } => context,
         }
     }
 }
@@ -153,7 +198,7 @@ impl fmt::Display for Constraint {
             Constraint::WellFormed { template, .. } => {
                 write!(f, "WF({template})")
             }
-            Constraint::Subtype { lhs, rhs, .. } => {
+            Constraint::Subtype { sub: lhs, sup: rhs, .. } => {
                 write!(f, "{lhs} <: {rhs}")
             }
             Constraint::BinaryOp {
@@ -172,9 +217,31 @@ impl fmt::Display for Constraint {
             } => {
                 write!(f, "{op} = {operand}{result}")
             }
+            Constraint::Requires {  condition, .. } => {
+                write!(f, "REQUIRES({condition})")
+            }
             Constraint::Ensures { condition, .. } => {
                 write!(f, "ENSURE({condition})")
             }
+            Constraint::LoopInvariantEntry { invariant, .. } => {
+                write!(f, "LOOP_INVARIANT_ENTRY({invariant})")
+            }
+            Constraint::LoopInvariantPreservation { invariant, .. } => {
+                write!(f, "LOOP_INVARIANT_PRESERVATION({invariant})")
+            }
+            Constraint::LoopVariantNonNegative { variant, .. } => {
+                write!(f, "LOOP_INVARIANT_NON_NEGATIVE({variant})")
+            }
+            Constraint::LoopVariantDecreases { variant, .. } => {
+                write!(f, "LOOP_INVARIANT_DECREASES({variant})")
+            }
+            Constraint::Fold { var, refinement, .. } => {
+                write!(f, "FOLD({var}, {refinement})")
+            }
+            // Constraint::Unfold { var, refinement, .. } => {
+            //     write!(f, "UNFOLD({var}, {refinement})")
+            // }
+
         }
     }
 }
@@ -330,6 +397,11 @@ impl ConstraintSet {
     /// Iterate over mutable constraints
     pub fn iter_mut(&mut self) -> impl Iterator<Item = &mut Constraint> {
         self.constraints.iter_mut()
+    }
+
+    /// Get mutable access to the internal Vec
+    pub fn constraints_mut(&mut self) -> &mut Vec<Constraint> {
+        &mut self.constraints
     }
 
     /// Consume and get all constraints

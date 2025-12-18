@@ -3,57 +3,129 @@ use merak_ast::{function::Modifier, meta::SourceRef, types::Type};
 use merak_errors::MerakError;
 use merak_ir::ssa_ir::{BlockId, CallTarget, SsaCfg, SsaContract, SsaInstruction};
 use merak_symbols::{SymbolId, SymbolKind, SymbolTable};
-use std::collections::{HashMap, HashSet};
+use std::{collections::{HashMap, HashSet}, fmt::Debug};
 
 lazy_static! {
     static ref EMPTY_STATE: StorageState = StorageState::empty();
 }
 
-pub struct StorageAnalysis {
-    /// All storage locations in the contract
-    pub locations: StorageLocationSet,
 
-    /// Storage state at entry/exit of each basic block
-    pub storage_states: StorageStateMap,
+/// Pre-computed analysis of which functions contain external calls
+pub struct CallGraphAnalysis {
+    /// Set of function IDs that contain external calls (directly or transitively)
+    functions_with_external_calls: HashSet<SymbolId>,
+}
 
-    /// Points where storage is invalidated (for warnings/diagnostics)
-    pub invalidation_points: InvalidationPointSet,
+impl CallGraphAnalysis {
+    /// Analyzes the entire contract and builds the call graph
+    pub fn analyze(contract: &SsaContract) -> Self {
+        let mut analysis = CallGraphAnalysis {
+            functions_with_external_calls: HashSet::new(),
+        };
+        
+        // Analyze each function in the contract
+        for cfg in &contract.functions {
+            let mut visited = HashSet::new();
+            if Self::contains_external_calls_recursive(
+                cfg.function_id,
+                contract,
+                &mut visited,
+            ) {
+                analysis.functions_with_external_calls.insert(cfg.function_id);
+            }
+        }
+        
+        analysis
+    }
+    
+    /// Query: Does this function contain external calls?
+    pub fn contains_external_calls(&self, fn_id: SymbolId) -> bool {
+        self.functions_with_external_calls.contains(&fn_id)
+    }
+    
+    /// Recursive helper: Check if function contains external calls transitively
+    fn contains_external_calls_recursive(
+        fn_id: SymbolId,
+        contract: &SsaContract,
+        visited: &mut HashSet<SymbolId>,
+    ) -> bool {
+        // Prevent infinite recursion
+        if visited.contains(&fn_id) {
+            return false;
+        }
+        visited.insert(fn_id);
+        
+        // Find the function's CFG
+        let cfg = contract.functions.iter()
+            .find(|f| f.function_id == fn_id)
+            .expect("Function must exist in contract");
+        
+        // Check all instructions in all blocks
+        for block in cfg.blocks.values() {
+            for instruction in &block.instructions {
+                match instruction {
+                    // Found direct external call
+                    SsaInstruction::Call { 
+                        target: CallTarget::External { .. }, 
+                        .. 
+                    } => {
+                        return true;
+                    }
+                    
+                    // Recurse into internal calls
+                    SsaInstruction::Call { 
+                        target: CallTarget::Internal(callee_id), 
+                        .. 
+                    } => {
+                        // Check if the callee contains external calls
+                        if Self::contains_external_calls_recursive(
+                            *callee_id,
+                            contract,
+                            visited,
+                        ) {
+                            return true;
+                        }
+                    }
+                    
+                    _ => {}
+                }
+            }
+        }
+        
+        false
+    }
 }
 
 pub fn analyze_storage(
     contract: &SsaContract,
-    cfg: &SsaCfg,
+    cfg: &mut SsaCfg,
     symbol_table: &SymbolTable,
-) -> Result<StorageAnalysis, MerakError> {
+) -> Result<(), MerakError> {
     let locations = StorageLocationSet::from_contract(contract, symbol_table);
 
-    let storage_states = compute_storage_states(cfg, &locations, symbol_table)?;
+    let call_graph = CallGraphAnalysis::analyze(contract);
 
-    let invalidation_points = detect_invalidation_points(cfg);
-
-    verify_storage_safety(cfg, &invalidation_points, &locations, symbol_table)?;
-
-    Ok(StorageAnalysis {
-        locations,
-        storage_states,
-        invalidation_points,
-    })
+    let storage_states = compute_storage_states(cfg, symbol_table, &call_graph)?;
+    
+    insert_fold_unfold_instructions(cfg, &storage_states, &locations, symbol_table, &call_graph);
+    
+    validate_cei_pattern(cfg, &symbol_table)?;
+    validate_immutability(cfg, &locations)?;
+    
+    Ok(())
 }
 
 // TODO: Implementar en StorageStateMap
 pub fn compute_storage_states(
     cfg: &SsaCfg,
-    locations: &StorageLocationSet,
     symbol_table: &SymbolTable,
+    call_graph: &CallGraphAnalysis,
 ) -> Result<StorageStateMap, MerakError> {
     let mut storage_states = StorageStateMap::new();
 
     for (block_id, _) in &cfg.blocks {
-        let entry_state = StorageState::empty();
-        let exit_state = StorageState::empty();
-
-        storage_states.set_entry_state(*block_id, entry_state);
-        storage_states.update_exit_state(*block_id, exit_state);
+        storage_states.set_entry_state(*block_id, StorageState::empty());
+        storage_states.update_exit_state(*block_id, StorageState::empty());
     }
 
     let mut worklist = vec![cfg.entry];
@@ -67,9 +139,9 @@ pub fn compute_storage_states(
 
         let block_exit_state = apply_transfer_function(
             &block_entry_state,
-            locations,
             &block.instructions,
             symbol_table,
+            call_graph
         );
 
         storage_states.set_entry_state(block_id, block_entry_state);
@@ -83,9 +155,9 @@ pub fn compute_storage_states(
 
 fn apply_transfer_function(
     block_entry_state: &StorageState,
-    locations: &StorageLocationSet,
     instructions: &[SsaInstruction],
     symbol_table: &SymbolTable,
+    call_graph: &CallGraphAnalysis
 ) -> StorageState {
     let mut new_entry_state = block_entry_state.clone();
     for instruction in instructions {
@@ -95,48 +167,27 @@ fn apply_transfer_function(
                 var,
                 source_ref: _,
             } => {
-                if !new_entry_state.is_unfolded(*var) {
-                    new_entry_state.unfold(*var);
-                }
+                new_entry_state.unfold(*var);
             }
             SsaInstruction::StorageStore {
                 var,
                 value: _,
                 source_ref: _,
             } => new_entry_state.fold(*var),
+            SsaInstruction::Call { target: CallTarget::External { .. }, .. } => {
+                new_entry_state.fold_all();
+            }
             SsaInstruction::Call {
-                dest: _,
-                target,
-                args: _,
-                source_ref: _,
+                target: CallTarget::Internal(fn_id), ..
             } => {
-                // TODO: Unclear disambiguation between external and internal calls. Possible generation of bugs here.
-                let symbol_id = match target {
-                    CallTarget::Internal(symbol_id) => symbol_id,
-                    CallTarget::External {
-                        contract: _,
-                        function,
-                    } => function,
-                };
+                let symbol_info = symbol_table.get_symbol(*fn_id);
+                //let reentrancy = get_reentrancy_modifier(*fn_id, symbol_table);
 
-                // TODO: This is possible wrong for now
-                let symbol_info = symbol_table.get_symbol(*symbol_id);
-
-                match &symbol_info.kind {
-                    SymbolKind::Function { reentrancy, .. }
-                    | SymbolKind::Entrypoint { reentrancy, .. } => match reentrancy {
-                        Modifier::Guarded | Modifier::Checked => {
-                            new_entry_state.invalidate_all_except_immutables(locations);
-                        }
-                        Modifier::Reentrant => {}
-
-                        _ => unreachable!("Payable reentrancy during storage analysis"),
-                    },
-                    _ => panic!(
-                        "Unsupported function kind for storage analysis: {:?}",
-                        symbol_info.kind
-                    ),
-                }
+                // TODO: Check contract
+                //*reentrancy == Modifier::Reentrant ||
+                if call_graph.contains_external_calls(*fn_id) {
+                    new_entry_state.fold_all();
+                } 
             }
             _ => {}
         }
@@ -145,147 +196,267 @@ fn apply_transfer_function(
     new_entry_state
 }
 
-fn detect_invalidation_points(cfg: &SsaCfg) -> InvalidationPointSet {
-    let mut invalidation_points = InvalidationPointSet::new();
-
-    // TODO: All loops are invalidation points for now
-    // TODO: Next step: Internal calls (interprocedural analysis)
-    cfg.loops
-        .as_ref()
-        .expect("Loop forest should have been planted")
-        .loops
-        .iter()
-        .for_each(|(loop_id, loop_info)| {
-            // TODO: Improve LoopInfo
-            let point = InvalidationPoint {
-                block_id: loop_info.header,
-                kind: InvalidationKind::LoopInvalidation { loop_id: *loop_id },
-                source_ref: SourceRef::unknown(),
-            };
-            invalidation_points.add(point);
-        });
-
-    for (block_id, block) in &cfg.blocks {
-        for (inst_id, inst) in block.instructions.iter().enumerate() {
-            match inst {
-                SsaInstruction::Call {
-                    dest: _,
-                    target:
-                        CallTarget::External {
-                            contract: _,
-                            function: _,
-                        },
-                    args: _,
-                    source_ref,
-                } => {
-                    let point = InvalidationPoint {
-                        block_id: *block_id,
-                        kind: InvalidationKind::ExternalCall {
-                            target: format!("FIX::ME"), // TODO: Fix this format!("{}::{}", contract, function),
-                            instruction_index: inst_id,
-                        },
-                        source_ref: source_ref.clone(),
-                    };
-                    invalidation_points.add(point);
+fn insert_fold_unfold_instructions(
+    cfg: &mut SsaCfg,
+    state_map: &StorageStateMap,
+    locations: &StorageLocationSet,
+    symbol_table: &SymbolTable,
+    call_graph: &CallGraphAnalysis,
+) {
+    for (block_id, block) in &mut cfg.blocks {
+        let entry_state = state_map.entry_state(*block_id);
+        let mut current_state = entry_state.clone();
+        let mut new_instructions = Vec::new();
+        
+        for instruction in &block.instructions {
+            match instruction {
+                SsaInstruction::StorageLoad { dest, var, source_ref } => {
+                    // If var is folded, insert unfold before load
+                    if current_state.is_folded(*var) {
+                        new_instructions.push(SsaInstruction::Unfold {
+                            var: *var,
+                            source_ref: source_ref.clone(),
+                        });
+                        current_state.unfold(*var);
+                    }
+                    
+                    // Insert original load
+                    new_instructions.push(instruction.clone());
+                    // var stays unfolded
                 }
-                _ => {} // No invalidation
+                
+                SsaInstruction::StorageStore { var, value, source_ref } => {
+                    // If var is folded, insert unfold before store
+                    if current_state.is_folded(*var) {
+                        new_instructions.push(SsaInstruction::Unfold {
+                            var: *var,
+                            source_ref: source_ref.clone(),
+                        });
+                        current_state.unfold(*var);
+                    }
+                    
+                    // Insert original store
+                    new_instructions.push(instruction.clone());
+                    
+                    // Insert fold after store
+                    new_instructions.push(SsaInstruction::Fold {
+                        var: *var,
+                        source_ref: source_ref.clone(),
+                    });
+                    current_state.fold(*var);
+                }
+                
+                SsaInstruction::Call { 
+                    dest, 
+                    target: CallTarget::External { object, method }, 
+                    args, 
+                    source_ref 
+                } => {
+                    // PRE-CALL: Unfold all MUTABLE storage vars
+                    for (var_id, location) in locations.iter() {
+                        if location.mutability == StorageMutability::Mutable 
+                           && current_state.is_folded(*var_id) {
+                            new_instructions.push(SsaInstruction::Unfold {
+                                var: *var_id,
+                                source_ref: source_ref.clone(),
+                            });
+                            current_state.unfold(*var_id);
+                        }
+                    }
+                    
+                    // Insert the call
+                    new_instructions.push(instruction.clone());
+                    
+                    // POST-CALL: Fold all UNFOLDED vars
+                    for (var_id, location) in locations.iter() {
+                        if location.mutability == StorageMutability::Mutable 
+                           && current_state.is_unfolded(*var_id) {
+                            new_instructions.push(SsaInstruction::Fold {
+                                var: *var_id,
+                                source_ref: source_ref.clone(),
+                            });
+                            current_state.fold(*var_id);
+                        }
+                    }
+                }
+                
+                SsaInstruction::Call { 
+                    target: CallTarget::Internal(fn_id), 
+                    source_ref,
+                    ..
+                } => {
+                    let reentrancy = get_reentrancy_modifier(*fn_id, symbol_table);
+
+                    let needs_fold_unfold = *reentrancy == Modifier::Reentrant 
+                        || call_graph.contains_external_calls(*fn_id);
+                    
+                    
+                    if needs_fold_unfold {
+                        // Same as external call
+                        
+                        // PRE-CALL: Unfold all mutable storage vars
+                        for (var_id, location) in locations.iter() {
+                            if location.mutability == StorageMutability::Mutable 
+                               && current_state.is_folded(*var_id) {
+                                new_instructions.push(SsaInstruction::Unfold {
+                                    var: *var_id,
+                                    source_ref: source_ref.clone(),
+                                });
+                                current_state.unfold(*var_id);
+                            }
+                        }
+                        
+                        // Insert the call
+                        new_instructions.push(instruction.clone());
+                        
+                        // POST-CALL: Fold all unfolded vars
+                        for (var_id, location) in locations.iter() {
+                            if location.mutability == StorageMutability::Mutable 
+                               && current_state.is_unfolded(*var_id) {
+                                new_instructions.push(SsaInstruction::Fold {
+                                    var: *var_id,
+                                    source_ref: source_ref.clone(),
+                                });
+                                current_state.fold(*var_id);
+                            }
+                        }
+                    } else {
+                        // Guarded or Checked: just insert the call
+                        new_instructions.push(instruction.clone());
+                    }
+                }
+                
+                _ => {
+                    new_instructions.push(instruction.clone());
+                }
             }
         }
+        
+        // CLEANUP: Fold any remaining unfolded vars at end of block
+        for (var_id, _) in locations.iter() {
+            if current_state.is_unfolded(*var_id) {
+                new_instructions.push(SsaInstruction::Fold {
+                    var: *var_id,
+                    source_ref: SourceRef::unknown(),
+                });
+            }
+        }
+        
+        // Replace block's instructions
+        block.instructions = new_instructions;
     }
-
-    invalidation_points
 }
 
-fn verify_checks_effects_interactions(
+fn validate_cei_pattern(
     cfg: &SsaCfg,
-    invalidation_points: &InvalidationPointSet,
+    symbol_table: &SymbolTable,
 ) -> Result<(), MerakError> {
-    for inv_point in invalidation_points.iter() {
-        // Only check ExternalCall invalidations
-        if let InvalidationKind::ExternalCall {
-            instruction_index, ..
-        } = &inv_point.kind
-        {
-            let block = cfg.blocks.get(&inv_point.block_id).unwrap();
-
-            // Check for storage operations after the call in same block
-            for instr in &block.instructions[instruction_index + 1..] {
-                match instr {
-                    SsaInstruction::StorageLoad {
-                        var: _, source_ref, ..
-                    } => {
-                        return Err(MerakError::StorageAccessAfterExternalCall {
-                            operation: "Read".to_string(),
-                            location_name: "TODO: Fix SymbolId to location name".to_string(),
-                            call_point: inv_point.source_ref.clone(),
-                            access_point: source_ref.clone(),
-                        });
-                    }
-
-                    SsaInstruction::StorageStore {
-                        var: _, source_ref, ..
-                    } => {
-                        return Err(MerakError::StorageAccessAfterExternalCall {
-                            operation: "Write".to_string(),
-                            location_name: "TODO: Fix SymbolId to location name".to_string(),
-                            call_point: inv_point.source_ref.clone(),
-                            access_point: source_ref.clone(),
-                        });
-                    }
-
-                    _ => continue,
+    // Only validate if the function is Checked (default)
+    let reentrancy = get_reentrancy_modifier(cfg.function_id, symbol_table);
+    
+    if *reentrancy != Modifier::Checked {
+        // Reentrant: user handles it
+        // Guarded: runtime guard handles it
+        return Ok(());
+    }
+    
+    // For Checked functions: validate CEI pattern
+    // Find external calls and check no stores after them
+    for (block_id, block) in &cfg.blocks {
+        for (idx, instr) in block.instructions.iter().enumerate() {
+            // Check external calls
+            if let SsaInstruction::Call { target: CallTarget::External { .. }, source_ref, .. } = instr {
+                check_no_stores_after_call(cfg, *block_id, idx, source_ref)?;
+            }
+            
+            // Also check internal calls with Reentrant modifier
+            if let SsaInstruction::Call { target: CallTarget::Internal(fn_id), source_ref, .. } = instr {
+                let call_reentrancy = get_reentrancy_modifier(*fn_id, symbol_table);
+                if *call_reentrancy == Modifier::Reentrant {
+                    check_no_stores_after_call(cfg, *block_id, idx, source_ref)?;
                 }
             }
         }
     }
-
+    
     Ok(())
 }
 
-fn verify_storage_safety(
+/// Recursively checks for StorageStore instructions after a call
+/// by following the CFG successors.
+///
+/// - For the initial block: starts checking from instruction_index + 1 (right after the call)
+/// - For successor blocks: starts checking from instruction 0
+fn check_no_stores_after_call(
     cfg: &SsaCfg,
-    invalidation_points: &InvalidationPointSet,
-    locations: &StorageLocationSet,
-    symbol_table: &SymbolTable,
+    block_id: BlockId,
+    call_instruction_index: usize,
+    call_source_ref: &SourceRef,
 ) -> Result<(), MerakError> {
-    // Get reentrancy mode
-    let reentrancy = match &symbol_table.get_symbol(cfg.function_id).kind {
-        SymbolKind::Function { reentrancy, .. } | SymbolKind::Entrypoint { reentrancy, .. } => {
-            reentrancy
+    let mut visited = HashSet::new();
+    let mut worklist = vec![(block_id, call_instruction_index + 1)];
+    
+    while let Some((current_block_id, start_idx)) = worklist.pop() {
+        // Avoid infinite loops
+        if visited.contains(&current_block_id) {
+            continue;
         }
-        _ => unreachable!("Invalid SymbolKind derived from CFG function id"),
-    };
-
-    if reentrancy == &Modifier::Checked {
-        match verify_checks_effects_interactions(cfg, invalidation_points) {
-            Ok(()) => {}
-            Err(e) => {
-                panic!("Storage analysis error: {} (TODO: push Err up)", e);
+        visited.insert(current_block_id);
+        
+        let block = cfg.blocks.get(&current_block_id).unwrap();
+        
+        // Check instructions from start_idx onward
+        for instr in &block.instructions[start_idx..] {
+            if let SsaInstruction::StorageStore { var, source_ref, .. } = instr {
+                // FOUND A WRITE AFTER CALL - ERROR!
+                return Err(MerakError::StorageAccessAfterExternalCall {
+                    operation: "write".to_string(),
+                    location_name: format!("{:?}", var), 
+                    access_point: source_ref.clone(),
+                    call_point: call_source_ref.clone(),
+                });
             }
         }
+        
+        // Follow all successors (start from index 0)
+        for &successor_id in &block.successors {
+            worklist.push((successor_id, 0));
+        }
     }
+    
+    Ok(())
+}
 
-    // 2. Verify no writes to immutables
-    for (_, block) in &cfg.blocks {
+fn validate_immutability(
+    cfg: &SsaCfg,
+    locations: &StorageLocationSet,
+) -> Result<(), MerakError> {
+    for (block_id, block) in &cfg.blocks {
         for instr in &block.instructions {
-            if let SsaInstruction::StorageStore {
-                var, source_ref, ..
-            } = instr
-            {
-                let location_info = locations.get(*var).unwrap();
-
-                if location_info.mutability == StorageMutability::Immutable {
+            if let SsaInstruction::StorageStore { var, source_ref, .. } = instr {
+                let location = locations.get(*var).unwrap();
+                
+                if location.mutability == StorageMutability::Immutable {
                     return Err(MerakError::WriteToImmutable {
-                        location_name: location_info.var_name.clone(),
+                        location_name: location.var_name.clone(),
                         write_point: source_ref.clone(),
                     });
                 }
             }
         }
     }
-
+    
     Ok(())
 }
+
+fn get_reentrancy_modifier(fn_id: SymbolId, symbol_table: &SymbolTable) -> &Modifier {
+    let symbol_info = symbol_table.get_symbol(fn_id);
+    match &symbol_info.kind {
+        SymbolKind::Function { reentrancy, .. } | SymbolKind::Entrypoint { reentrancy, .. } => reentrancy,
+        _ => panic!("Unsupported function kind for storage analysis: {:?}", symbol_info.kind),
+    }
+}
+
 
 pub struct StorageLocationSet {
     pub locations: HashMap<SymbolId, StorageLocation>,
@@ -302,7 +473,7 @@ pub struct StorageLocation {
     pub var_name: String,
 }
 
-#[derive(PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum StorageMutability {
     Mutable,
     Immutable,
@@ -312,7 +483,7 @@ impl StorageLocationSet {
     pub fn from_contract(contract: &SsaContract, symbol_table: &SymbolTable) -> StorageLocationSet {
         let mut locations = HashMap::new();
 
-        for state_var in &contract.data.variables {
+        for state_var in &contract.variables {
             let symbol_id = symbol_table.get_symbol_id_by_node_id(state_var.id).unwrap();
             let symbol_info = symbol_table.get_symbol_by_node_id(state_var.id).unwrap();
             locations.insert(
@@ -330,7 +501,7 @@ impl StorageLocationSet {
             );
         }
 
-        for state_const in &contract.data.constants {
+        for state_const in &contract.constants {
             let symbol_id = symbol_table
                 .get_symbol_id_by_node_id(state_const.id)
                 .unwrap();
@@ -366,6 +537,7 @@ impl StorageLocationSet {
     }
 }
 
+#[derive(Debug)]
 pub struct StorageStateMap {
     /// For each basic block, the storage state at ENTRY
     block_entry_states: HashMap<BlockId, StorageState>,
@@ -376,101 +548,55 @@ pub struct StorageStateMap {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StorageState {
-    /// Locations that are unfolded
+    /// Variables currently in UNFOLDED state
+    /// If var not in unfolded -> var is FOLDED
     unfolded: HashSet<SymbolId>,
-
-    /// Locations that are explicitly invalidated
-    /// (unfolded -> external call happened)
-    invalidated: HashSet<SymbolId>,
 }
 
 impl StorageState {
     pub fn empty() -> Self {
         StorageState {
             unfolded: HashSet::new(),
-            invalidated: HashSet::new(),
         }
     }
-
-    /// The location was never unfolded in this path
+    
     pub fn is_folded(&self, loc: SymbolId) -> bool {
-        !self.unfolded.contains(&loc) && !self.invalidated.contains(&loc)
+        !self.unfolded.contains(&loc)
     }
-
-    /// The location is unfolded and valid
+    
     pub fn is_unfolded(&self, loc: SymbolId) -> bool {
-        self.unfolded.contains(&loc) && !self.invalidated.contains(&loc)
+        self.unfolded.contains(&loc)
     }
-
-    /// The location was unfolded but then invalidated
-    pub fn is_invalidated(&self, loc: SymbolId) -> bool {
-        self.invalidated.contains(&loc)
-    }
-
-    /// Unfold a location
+    
     pub fn unfold(&mut self, loc: SymbolId) {
         self.unfolded.insert(loc);
-        self.invalidated.remove(&loc); // Clear invalidation
     }
-
-    /// Fold a location (write it back)
+    
     pub fn fold(&mut self, loc: SymbolId) {
         self.unfolded.remove(&loc);
-        self.invalidated.remove(&loc);
     }
-
-    /// Invalidate all locations (after external call)
-    pub fn invalidate_all(&mut self) {
-        // Move everything from unfolded to invalidated
-        for loc in self.unfolded.drain() {
-            self.invalidated.insert(loc);
+    
+    pub fn unfold_all_mutable(&mut self, locations: &StorageLocationSet) {
+        for (var_id, location) in locations.iter() {
+            if location.mutability == StorageMutability::Mutable {
+                self.unfolded.insert(*var_id);
+            }
         }
     }
-
-    pub fn invalidate_all_except_immutables(&mut self, locations: &StorageLocationSet) {
-        let to_invalidate: Vec<_> = self
-            .unfolded
-            .iter()
-            .filter(|&&loc| {
-                locations
-                    .get(loc)
-                    .map(|l| l.mutability == StorageMutability::Mutable)
-                    .unwrap_or(false)
-            })
-            .copied()
-            .collect();
-
-        for loc in to_invalidate {
-            self.invalidated.insert(loc);
-        }
-        self.unfolded.retain(|loc| {
-            locations
-                .get(*loc)
-                .map(|l| l.mutability == StorageMutability::Immutable)
-                .unwrap_or(false)
-        });
+    
+    pub fn fold_all(&mut self) {
+        self.unfolded.clear();
     }
-
-    /// Merge two states (for join points in CFG)
+    
+    /// Merge two states (at CFG join points)
     pub fn merge(&self, other: &StorageState) -> StorageState {
         // Conservative: only unfolded if unfolded in BOTH paths
-        let unfolded = self
-            .unfolded
+        let unfolded = self.unfolded
             .intersection(&other.unfolded)
             .copied()
             .collect();
-
-        // Invalidated if invalidated in ANY path
-        let invalidated = self
-            .invalidated
-            .union(&other.invalidated)
-            .copied()
-            .collect();
-
-        StorageState {
-            unfolded,
-            invalidated,
-        }
+        
+        StorageState { unfolded }
     }
 }
 
@@ -507,59 +633,5 @@ impl StorageStateMap {
         }
         self.block_exit_states.insert(block_id, state);
         true
-    }
-}
-
-pub struct InvalidationPointSet {
-    points: Vec<InvalidationPoint>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InvalidationPoint {
-    /// In which basic block it occurs
-    pub block_id: BlockId,
-
-    /// What type of invalidation it is
-    pub kind: InvalidationKind,
-
-    /// Source location for error messages
-    pub source_ref: SourceRef,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum InvalidationKind {
-    /// Call to external function (another contract)
-    ExternalCall {
-        /// What is being called
-        target: String, // For diagnostics
-
-        /// Index of the instruction within the block
-        instruction_index: usize,
-    },
-
-    /// Call to own function that may make external calls
-    /// (requires interprocedural analysis later)
-    TransitiveCall { function_name: String },
-
-    /// Loop that may contain external calls in its body
-    /// (conservative: assume it iterates and calls)
-    LoopInvalidation { loop_id: usize },
-}
-
-impl InvalidationPointSet {
-    pub fn new() -> Self {
-        InvalidationPointSet { points: Vec::new() }
-    }
-
-    pub fn add(&mut self, point: InvalidationPoint) {
-        self.points.push(point);
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = &InvalidationPoint> {
-        self.points.iter()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.points.is_empty()
     }
 }

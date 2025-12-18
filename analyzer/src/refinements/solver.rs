@@ -4,6 +4,7 @@ use merak_ast::{
     predicate::{ArithOp, Predicate, RefinementExpr, RelOp, UnaryOp},
     NodeId,
 };
+use merak_symbols::SymbolId;
 use std::collections::HashSet;
 use z3::Context;
 
@@ -23,6 +24,11 @@ pub enum SolverError {
     UnsatisfiableConstraint {
         constraint: String,
         reason: String,
+    },
+
+    /// Type mismatch between refinements
+    TypeMismatch {
+        message: String
     },
 
     /// SMT solver timeout
@@ -54,6 +60,9 @@ impl std::fmt::Display for SolverError {
             }
             SolverError::UnsatisfiableEnsures { message } => {
                 write!(f, "Unsatisfiable ensures: {}", message)
+            }
+            SolverError::TypeMismatch { message } => {
+                write!(f, "Type mismatch: {}", message)
             }
         }
     }
@@ -116,12 +125,22 @@ impl<'ctx> ConstraintSolver<'ctx> {
 
             // Temporarily take constraints to allow &mut self in loop
             // (safe: check/strengthen don't access self.constraints)
-            let constraints = std::mem::take(&mut self.constraints);
+            let mut constraints = std::mem::take(&mut self.constraints);
+            let constraints_vec = constraints.constraints_mut();
 
-            for constraint in constraints.iter() {
-                if !self.check_constraint(constraint)? {
+            // Use indices instead of iter_mut to avoid borrow conflicts
+            for i in 0..constraints_vec.len() {
+                if !self.check_constraint(&mut constraints_vec[i])? {
                     // Constraint not satisfied, strengthen liquid variables
-                    changed |= self.strengthen_for_constraint(constraint)?;
+                    match self.strengthen_for_constraint(&constraints_vec[i]) {
+                        Ok(did_change) => {
+                            changed |= did_change;
+                        }
+                        Err(e) => {
+                            self.constraints = constraints;
+                            return Err(e);
+                        }
+                    }
                 }
             }
 
@@ -149,7 +168,7 @@ impl<'ctx> ConstraintSolver<'ctx> {
 
         for constraint in self.constraints.iter() {
             match constraint {
-                Constraint::Subtype { lhs, rhs, .. } => {
+                Constraint::Subtype { sub: lhs, sup: rhs, .. } => {
                     if let Some(var) = lhs.liquid_var() {
                         vars.insert(var);
                     }
@@ -188,7 +207,14 @@ impl<'ctx> ConstraintSolver<'ctx> {
                         vars.insert(var);
                     }
                 }
-                Constraint::Ensures { .. } => {}
+                Constraint::Ensures { .. } | 
+                Constraint::Requires { .. } |
+                Constraint::Fold { .. } | 
+                //Constraint::Unfold { .. } |
+                Constraint::LoopInvariantEntry { .. } | 
+                Constraint::LoopInvariantPreservation { .. } | 
+                Constraint::LoopVariantDecreases { .. } | 
+                Constraint::LoopVariantNonNegative { .. } => {}
             }
         }
 
@@ -196,14 +222,14 @@ impl<'ctx> ConstraintSolver<'ctx> {
     }
 
     /// Check if a constraint is satisfied under current assignment
-    fn check_constraint(&mut self, constraint: &Constraint) -> SolverResult<bool> {
+    fn check_constraint(&mut self, constraint: &mut Constraint) -> SolverResult<bool> {
         match constraint {
             Constraint::WellFormed {
                 context, template, ..
             } => self.check_well_formed(context, template),
 
             Constraint::Subtype {
-                context, lhs, rhs, ..
+                context, sub: lhs, sup: rhs, ..
             } => self.check_subtype(context, lhs, rhs),
             Constraint::BinaryOp {
                 context,
@@ -224,42 +250,103 @@ impl<'ctx> ConstraintSolver<'ctx> {
             Constraint::Ensures {
                 context,
                 condition,
-                location,
-            } => self.check_ensures(context, condition, location),
+                ..
+            } => self.check_ensures(context, condition),
+            Constraint::Requires { 
+                context, 
+                condition,
+                .. 
+            } => self.check_requires(context, condition),
+            Constraint::LoopInvariantEntry { 
+                context, 
+                invariant, 
+                .. 
+            } => self.check_loop_invariant_entry(context, invariant),
+            Constraint::LoopInvariantPreservation { 
+                context, 
+                invariant, 
+                .. 
+            } => self.check_loop_invariant_preservation(context, invariant),
+            Constraint::LoopVariantDecreases { 
+                entry_context, 
+                preservation_context, 
+                variant, 
+                .. 
+            } => self.check_variant_decreases(entry_context, preservation_context, variant),
+            Constraint::LoopVariantNonNegative { 
+                context, 
+                variant, 
+                .. 
+            } => self.check_variant_non_negative(context, variant),
+            Constraint::Fold { 
+                context,
+                var,
+                refinement, 
+                ..
+            } => self.check_fold(context, var, refinement),
         }
     }
 
     /// Check if a constraint is satisfied with a specific context
-    fn check_constraint_with_context(
-        &mut self,
-        constraint: &Constraint,
-        context: &TypeContext,
-    ) -> SolverResult<bool> {
-        match constraint {
-            Constraint::WellFormed { template, .. } => self.check_well_formed(context, template),
+    // fn check_constraint_with_context(
+    //     &mut self,
+    //     constraint: &mut Constraint,
+    //     context: &TypeContext,
+    // ) -> SolverResult<bool> {
+    //     match constraint {
+    //         Constraint::WellFormed { template, .. } => self.check_well_formed(context, template),
+    //         Constraint::Subtype { sub: lhs, sup: rhs, .. } => self.check_subtype(context, lhs, rhs),
+    //         Constraint::BinaryOp {
+    //             op,
+    //             left,
+    //             right,
+    //             result,
+    //             ..
+    //         } => self.check_binary_op(context, op, left, right, result),
 
-            Constraint::Subtype { lhs, rhs, .. } => self.check_subtype(context, lhs, rhs),
-            Constraint::BinaryOp {
-                op,
-                left,
-                right,
-                result,
-                ..
-            } => self.check_binary_op(context, op, left, right, result),
-
-            Constraint::UnaryOp {
-                op,
-                operand,
-                result,
-                ..
-            } => self.check_unary_op(context, op, operand, result),
-            Constraint::Ensures {
-                condition,
-                location,
-                ..
-            } => self.check_ensures(context, condition, location),
-        }
-    }
+    //         Constraint::UnaryOp {
+    //             op,
+    //             operand,
+    //             result,
+    //             ..
+    //         } => self.check_unary_op(context, op, operand, result),
+    //         Constraint::Ensures {
+    //             condition,
+    //             ..
+    //         } => self.check_ensures(context, condition),
+    //         Constraint::Requires { 
+    //             condition,
+    //             .. 
+    //         } => self.check_requires(context, condition),
+    //         Constraint::LoopInvariantEntry { 
+    //             invariant, 
+    //             .. 
+    //         } => self.check_loop_invariant_entry(context, invariant),
+    //         Constraint::LoopInvariantPreservation { 
+    //             invariant, 
+    //             .. 
+    //         } => self.check_loop_invariant_preservation(context, invariant),
+    //         Constraint::LoopVariantDecreases {
+    //             entry_context, 
+    //             variant, 
+    //             .. 
+    //         } => self.check_variant_decreases(entry_context, context, variant),
+    //         Constraint::LoopVariantNonNegative { 
+    //             variant, 
+    //             .. 
+    //         } => self.check_variant_non_negative(context, variant),
+    //         Constraint::Fold { 
+    //             var,
+    //             refinement, 
+    //             ..
+    //         } => self.check_fold(context, var, refinement),
+    //         // Constraint::Unfold { 
+    //         //     var, 
+    //         //     refinement, 
+    //         //     ..
+    //         // } => self.check_unfold(context, var, refinement)
+    //     }
+    // }
 
     /// Check well-formedness: all free variables in refinement are in scope
     fn check_well_formed(&self, context: &TypeContext, template: &Template) -> SolverResult<bool> {
@@ -280,17 +367,19 @@ impl<'ctx> ConstraintSolver<'ctx> {
     fn check_subtype(
         &mut self,
         context: &TypeContext,
-        lhs: &Template,
-        rhs: &Template,
+        lhs: &mut Template,
+        rhs: &mut Template,
     ) -> SolverResult<bool> {
         // Check base types match
         if lhs.base_type() != rhs.base_type() {
             return Ok(false);
         }
 
-        // Get predicates (applying current assignment for liquid vars)
+        lhs.replace_binder("__self");
+        rhs.replace_binder("__self");
         let lhs_pred = self.get_predicate(lhs);
         let rhs_pred = self.get_predicate(rhs);
+        println!("lhs_pred: {:?}, rhs_pred: {:?}", lhs_pred, rhs_pred);
 
         // Check implication: context ∧ lhs_pred ⇒ rhs_pred
         self.check_implication(context, &lhs_pred, &rhs_pred)
@@ -306,13 +395,116 @@ impl<'ctx> ConstraintSolver<'ctx> {
         &mut self,
         context: &TypeContext,
         condition: &Predicate,
-        location: &SourceRef,
     ) -> Result<bool, SolverError> {
         self.check_implication(
             context,
             &Predicate::True(NodeId::new(0), SourceRef::unknown()),
             condition,
         )
+    }
+
+    /// Check precondition at call site
+    ///
+    /// Γ ⊢ P
+    ///
+    /// At the call site, verify that the precondition P (declared in the
+    /// function being called) is satisfied by the current context.
+    fn check_requires(
+        &mut self,
+        context: &TypeContext,
+        condition: &Predicate,
+    ) -> Result<bool, SolverError> {
+        // Verify: context ⇒ condition
+        self.check_implication(
+            context,
+            &Predicate::True(NodeId::new(0), SourceRef::unknown()),
+            condition,
+        )
+    }
+
+    /// Check fold operation
+    ///
+    /// fold(var) → assert(refinement(var))
+    ///
+    /// Fold is an ASSERTION. We must prove that after manipulating the storage
+    /// variable, its declared refinement still holds. This is the core of
+    /// storage safety verification.
+    fn check_fold(
+        &mut self,
+        context: &TypeContext,
+        var: &SymbolId,
+        refinement: &Predicate,
+    ) -> Result<bool, SolverError> {
+        // Verify: context ⇒ refinement
+        // The context includes all transformations that happened while
+        // the variable was unfolded (loads, stores, computations)
+        
+        self.check_implication(
+            context,
+            &Predicate::True(NodeId::new(0), SourceRef::unknown()),
+            refinement,
+        )
+    }
+
+    fn check_loop_invariant_entry(
+        &mut self,
+        context: &TypeContext,
+        invariant: &Predicate,
+    ) -> Result<bool, SolverError> {
+        // Γ ⊢ I (invariant must hold at entry)
+        self.check_implication(
+            context,
+            &Predicate::True(NodeId::new(0), SourceRef::unknown()),
+            invariant,
+        )
+    }
+
+    fn check_loop_invariant_preservation(
+        &mut self,
+        context: &TypeContext,
+        invariant: &Predicate,
+    ) -> Result<bool, SolverError> {
+        // Context already includes invariant as assumption
+        // and all transformations from loop body
+        // We just need to check that invariant still holds
+        self.check_implication(
+            context,
+            &Predicate::True(NodeId::new(0), SourceRef::unknown()),
+            invariant,
+        )
+    }
+
+    fn check_variant_non_negative(
+        &mut self,
+        context: &TypeContext,
+        variant: &RefinementExpr,
+    ) -> Result<bool, SolverError> {
+        // Convert variant ≥ 0 to predicate and check
+        let zero = RefinementExpr::IntLit(0, NodeId::new(0), SourceRef::unknown());
+        let pred = Predicate::BinRel {
+            op: RelOp::Geq,
+            lhs: variant.clone(),
+            rhs: zero,
+            id: NodeId::new(0),
+            source_ref: SourceRef::unknown(),
+        };
+        
+        self.check_implication(
+            context,
+            &Predicate::True(NodeId::new(0), SourceRef::unknown()),
+            &pred,
+        )
+    }
+
+    fn check_variant_decreases(
+        &mut self,
+        entry_context: &TypeContext,
+        preservation_context: &TypeContext,
+        variant: &RefinementExpr,
+    ) -> Result<bool, SolverError> {
+
+        println!("Check variant decreases unimplemented. Always valid");
+        return Ok(true)
     }
 
     /// Get the predicate for a template under current assignment
@@ -727,13 +919,23 @@ impl<'ctx> ConstraintSolver<'ctx> {
     fn strengthen_for_constraint(&mut self, constraint: &Constraint) -> SolverResult<bool> {
         match constraint {
             Constraint::Subtype {
-                context, lhs, rhs, ..
+                context, sub, sup, location
             } => {
                 // If rhs has a liquid variable, try to strengthen it
-                if let Some(kappa) = rhs.liquid_var() {
-                    return self.strengthen_liquid_var(kappa, context, lhs);
+                if let Some(kappa) = sup.liquid_var() {
+                    return self.strengthen_liquid_var(kappa, context, sub);
                 }
-                Ok(false)
+                Err(SolverError::TypeMismatch {
+                    message: format!(
+                        "Type error: cannot satisfy subtyping constraint\n\
+                        Expected: {}\n\
+                        Found: {}\n\
+                        Location: {:?}",
+                        sup,   // El tipo esperado
+                        sub,   // El tipo que tenemos
+                        location
+                    )
+                })
             }
             _ => Ok(false), // Only strengthen for Subtype constraints
         }

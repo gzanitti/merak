@@ -46,24 +46,23 @@ pub enum MerakError {
     #[error("Redefinition of '{name}' at {source_ref}")]
     ConstantRedefinition { name: String, source_ref: SourceRef },
 
-    #[error("Function '{name}' inside {state} is already declared at {source_ref}")]
+    #[error("Function '{name}' already declared at {source_ref}")]
     FunctionRedefinition {
         name: String,
-        state: String,
         source_ref: SourceRef,
     },
 
-    #[error("State '{state}' at {source_ref} is undefined")]
-    UndefinedState {
-        state: String,
-        source_ref: SourceRef,
-    },
+    // #[error("State '{state}' at {source_ref} is undefined")]
+    // UndefinedState {
+    //     state: String,
+    //     source_ref: SourceRef,
+    // },
 
-    #[error("State '{state}' is defined but not declared in contract at {source_ref}")]
-    UndeclaredState {
-        state: String,
-        source_ref: SourceRef,
-    },
+    // #[error("State '{state}' is defined but not declared in contract at {source_ref}")]
+    // UndeclaredState {
+    //     state: String,
+    //     source_ref: SourceRef,
+    // },
 
     #[error("Type mismatch: expected {expected}, found {found} at {source_ref}")]
     TypeMismatch {
@@ -155,6 +154,15 @@ pub enum MerakError {
 
     #[error("Constraint Solving Failed: {message}")]
     ConstraintSolvingFailed { message: String },
+
+    #[error("'{name}' is not callable at {source_ref}")]
+    NotCallable { name: String, source_ref: SourceRef },
+
+    #[error("'{found}' is not callable at {source_ref}")]
+    MemberCallOnNonContract { found: String, source_ref: SourceRef },
+
+    #[error("'{method}' is not defined in contract '{contract}' at {source_ref}")]
+    UndefinedMethod {method: String, contract: String, source_ref: SourceRef }
 }
 
 impl From<String> for MerakError {

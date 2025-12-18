@@ -12,3 +12,6 @@ merak-errors.workspace = true
 merak-symbols.workspace = true
 primitive-types = "0.13.1"
 indexmap = "2.0"
+
+[dev-dependencies]
+merak-analyzer.workspace = true

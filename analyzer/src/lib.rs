@@ -1,15 +1,14 @@
-use merak_ast::contract::{Contract, Program, StateDef};
-use merak_ast::expression::Expression;
+use merak_ast::contract::{File, Program};
+use merak_ast::expression::{Expression, Literal};
 use merak_ast::function::{Function, Modifier, Visibility};
 use merak_ast::statement::{Block, Statement};
 use merak_ast::types::Type;
-use merak_ast::NodeIdGenerator;
 use merak_errors::MerakError;
 use merak_ir::ssa_ir::{SsaCfg, SsaContract};
-use merak_symbols::{QualifiedName, SymbolKind, SymbolNamespace, SymbolTable};
+use merak_symbols::{QualifiedName, SymbolId, SymbolKind, SymbolNamespace, SymbolTable};
 
-mod refinements;
-mod storage;
+pub mod refinements;
+pub mod storage;
 mod typechecker;
 use typechecker::Typechecker;
 
@@ -20,11 +19,25 @@ pub fn analyze(program: &Program) -> Result<SymbolTable, MerakError> {
     let mut symbol_table = SymbolTable::new();
 
     // For each contract, collect symbols then resolve references
-    for (_contract_name, contract) in &program.contracts {
-        // Phase 1: Collect symbol definitions for this contract
-        if let Err(e) = collect_and_resolve_contract(contract, &mut symbol_table, &mut errors) {
+    for (contract_name, file) in &program.files {
+        println!("Collecting symbols for {contract_name}");
+
+        for import in &file.imports {
+            if let Some(alias) = &import.alias {
+                let symbol_id = symbol_table.lookup(&import.contract_name, SymbolNamespace::Type).unwrap();
+                symbol_table.insert(alias.clone(), SymbolNamespace::Type, symbol_id);
+            }
+        }
+        collect_and_resolve_interfaces(file, &mut symbol_table, &mut errors);
+        if let Err(e) = collect_and_resolve_contract(file, &mut symbol_table, &mut errors) {
             errors.push(e);
         }
+        if !errors.is_empty() {
+            return Err(errors.into_iter().next().unwrap());
+        }
+        
+        
+        symbol_table.clean_scopes();
     }
 
     // Return error if any were collected
@@ -42,36 +55,30 @@ pub fn analyze(program: &Program) -> Result<SymbolTable, MerakError> {
 
 pub fn analyze_ssa(
     contract: SsaContract,
-    cfg: SsaCfg,
+    cfg: &mut SsaCfg,
     symbol_table: &mut SymbolTable,
 ) -> Result<(), MerakError> {
-    let storage_results = analyze_storage(&contract, &cfg, &symbol_table)?;
+    let storage_results = analyze_storage(&contract, cfg, symbol_table)?;
     //analyze_refinements(&cfg, symbol_table)
     Ok(())
 }
 
 fn collect_and_resolve_contract(
-    contract: &Contract,
+    file: &File,
     symbol_table: &mut SymbolTable,
     errors: &mut Vec<MerakError>,
 ) -> Result<(), MerakError> {
-    let contract_name = &contract.data.name;
-
+    let contract_name = &file.contract.name;
+    let contract_node_id = file.contract.id;
     // Save the current scope (should be global)
-    let global_scope = symbol_table.get_current_scope();
-
-    // Add contract itself
-    let temp_gen = NodeIdGenerator::new();
-    let contract_node_id = temp_gen.next();
+    //let global_scope = symbol_table.get_current_scope();
 
     let contract_qname = QualifiedName::from_string(contract_name.clone());
     let _ = symbol_table
         .add_symbol(
             contract_node_id,
             contract_qname.clone(),
-            SymbolKind::Contract {
-                states: contract.data.states.clone(),
-            },
+            SymbolKind::Contract,
             None,
         )
         .map_err(|e| errors.push(e));
@@ -80,13 +87,16 @@ fn collect_and_resolve_contract(
     let _ = symbol_table.push_scope();
 
     // Add state variables
-    for state_var in &contract.data.variables {
+    for state_var in &file.contract.variables {
         let var_qname = QualifiedName::new(vec![contract_name.clone(), state_var.name.clone()]);
         if state_var.ty.constraint.contains_old() {
             errors.push(MerakError::OldInvalidUse {
                 source_ref: state_var.source_ref.clone(),
             });
         }
+        
+        resolve_names_in_expression(&state_var.expr, symbol_table, errors);
+
         let _ = symbol_table
             .add_symbol(
                 state_var.id(),
@@ -98,13 +108,16 @@ fn collect_and_resolve_contract(
     }
 
     // Add state constants
-    for state_const in &contract.data.constants {
+    for state_const in &file.contract.constants {
         let const_qname = QualifiedName::new(vec![contract_name.clone(), state_const.name.clone()]);
         if state_const.ty.constraint.contains_old() {
             errors.push(MerakError::OldInvalidUse {
                 source_ref: state_const.source_ref.clone(),
             });
         }
+
+        resolve_names_in_expression(&state_const.expr, symbol_table, errors);
+
         let _ = symbol_table
             .add_symbol(
                 state_const.id(),
@@ -116,7 +129,7 @@ fn collect_and_resolve_contract(
     }
 
     // Handle constructor
-    if let Some(constructor) = &contract.data.constructor {
+    if let Some(constructor) = &file.contract.constructor {
         // Register constructor itself in symbol table
         let constructor_qname =
             QualifiedName::new(vec![contract_name.clone(), "constructor".to_string()]);
@@ -125,7 +138,7 @@ fn collect_and_resolve_contract(
             .add_symbol(
                 constructor.id(),
                 constructor_qname,
-                SymbolKind::Constructor {
+                SymbolKind::ContractInit {
                     contract: contract_name.clone(),
                 },
                 None, // Constructors have no return type
@@ -159,103 +172,104 @@ fn collect_and_resolve_contract(
         // Collect symbols from constructor body
         collect_and_resolve_block(
             &constructor.body,
-            contract_name,
-            &["constructor"],
+            &vec![contract_name.to_string(), "constructor".to_string()],
             symbol_table,
             errors,
-            &contract.data.states,
         );
 
         // Pop constructor scope
         symbol_table.pop_scope();
     }
 
-    // Validate and collect/resolve state definitions
-    let mut defined_states = std::collections::HashSet::new();
-
-    // Phase 1: Add all state symbols to the symbol table first
-    // This ensures all states are available before resolving any references (forward references)
-    for (state_name, state_def) in &contract.state_defs {
-        // Validate state is declared
-        if !contract.data.states.contains(state_name) {
-            errors.push(MerakError::UndeclaredState {
-                state: state_name.clone(),
-                source_ref: state_def.source_ref.clone(),
+    let mut declared_functions = std::collections::HashSet::new();
+    for function in &file.contract.functions {
+        if declared_functions.contains(&function.name) {
+            errors.push(MerakError::FunctionRedefinition {
+                name: function.name.clone(),
+                source_ref: function.source_ref.clone(),
             });
         }
-
-        defined_states.insert(state_name.clone());
-
-        // Add state symbol
-        let temp_state_id = temp_gen.next();
-        let state_qname = QualifiedName::new(vec![contract_name.clone(), state_name.clone()]);
-        let _ = symbol_table
-            .add_symbol(
-                temp_state_id,
-                state_qname.clone(),
-                SymbolKind::State {
-                    contract: contract_name.clone(),
-                },
-                None,
-            )
-            .map_err(|e| errors.push(e));
-    }
-
-    // Phase 2: Process functions in each state
-    // Now all state symbols are in the table, so 'become' statements can reference any state
-    for (state_name, state_def) in &contract.state_defs {
-        collect_and_resolve_state(
-            state_def,
-            contract_name,
-            state_name,
+        collect_and_resolve_function(
+            function,
+            contract_name.to_string(),
             symbol_table,
             errors,
-            &contract.data.states,
         );
-    }
 
-    // Validate all declared states have definitions
-    for declared_state in &contract.data.states {
-        if !defined_states.contains(declared_state) {
-            errors.push(MerakError::UndefinedState {
-                state: declared_state.clone(),
-                source_ref: merak_ast::meta::SourceRef { start: 0, end: 0 },
-            });
+        if !errors.is_empty() {
+            // TODO: Vec<MErakError>
+            return Err(errors.swap_remove(0));
         }
+
+        declared_functions.insert(function.name.clone());
     }
 
     // Pop contract scope
     symbol_table.pop_scope();
 
     // Restore global scope
-    symbol_table.set_current_scope(global_scope);
-
-    if !errors.is_empty() {
-        // TODO: Vec<MErakError>
-        return Err(errors.swap_remove(0));
-    }
+    //symbol_table.set_current_scope(global_scope);
 
     Ok(())
 }
 
-fn collect_and_resolve_state(
-    state_def: &StateDef,
-    contract_name: &str,
-    state_name: &str,
-    symbol_table: &mut SymbolTable,
-    errors: &mut Vec<MerakError>,
-    valid_states: &[String],
-) {
-    let mut declared_functions = std::collections::HashSet::new();
-    for function in &state_def.functions {
-        if declared_functions.contains(&function.name) {
-            errors.push(MerakError::FunctionRedefinition {
-                name: function.name.clone(),
-                state: state_name.to_string(),
-                source_ref: function.source_ref.clone(),
-            });
+fn collect_and_resolve_interfaces(
+    file: &File,
+    symbol_table: &mut SymbolTable, 
+    errors: &mut Vec<MerakError>) 
+{
+    for interface in &file.interfaces {
+        let interface_qname = QualifiedName::new(vec![file.contract.name.clone(), interface.name.clone()]);
+
+        let mut interface_fn_symbols = vec![];
+        for interface_fn in &interface.functions {
+            let interface_fn_qname = QualifiedName::new(vec![
+                file.contract.name.clone(),
+                interface.name.clone(),
+                interface_fn.name.clone(),
+            ]);
+
+            let return_type = match interface_fn.return_type.clone() {
+                Some(ty) => ty,
+                None => Type::empty_tuple("__self".to_string()),
+            };
+            
+            let symbol_fn = symbol_table
+                .add_symbol(
+                    interface_fn.id.clone(),
+                    interface_fn_qname,
+                    SymbolKind::InterfaceFunction {
+                        params: interface_fn.params.clone(),
+                        return_type: return_type,
+                    },
+                None)
+                .unwrap_or_else(|e| {
+                    errors.push(e);
+                    SymbolId::new(0) // default value in case of error
+                });
+
+            interface_fn_symbols.push(symbol_fn);
         }
 
+        let _ = symbol_table
+            .add_symbol(
+                interface.id.clone(),
+                interface_qname,
+                SymbolKind::Interface { functions: interface_fn_symbols },
+                None,
+            )
+            .map_err(|e| errors.push(e));
+    }
+}
+
+
+
+fn collect_and_resolve_function(
+    function: &Function,
+    contract_name: String,
+    symbol_table: &mut SymbolTable,
+    errors: &mut Vec<MerakError>,
+) {        
         // Old(..) is only valid on function ensure
         for p in &function.requires {
             if p.contains_old() {
@@ -265,38 +279,44 @@ fn collect_and_resolve_state(
             }
         }
 
-        declared_functions.insert(function.name.clone());
-
         let func_qname = QualifiedName::new(vec![
             contract_name.to_string(),
-            state_name.to_string(),
             function.name.clone(),
         ]);
 
-        // TODO: This functrion should return Result<(), MerakError>
-        let reentrancy = validate_modifiers(function);
+        let reentrancy = match validate_modifiers(function) {
+            Ok(r) => r,
+            Err(e) => {
+                errors.push(e);
+                return;
+            }
+        };
+
 
         let kind = match function.visibility {
             Visibility::Entrypoint => SymbolKind::Entrypoint {
-                state: state_name.to_string(),
                 reentrancy,
                 parameters: function.params.clone(),
+                ensures: function.ensures.clone(),
+                requires: function.requires.clone(),
                 return_type: function
                     .return_type
                     .clone()
                     .unwrap_or_else(|| Type::empty_tuple("__self".to_string())),
             },
             Visibility::Internal | Visibility::External => SymbolKind::Function {
-                state: state_name.to_string(),
                 visibility: function.visibility.clone(),
                 reentrancy,
                 parameters: function.params.clone(),
+                ensures: function.ensures.clone(),
+                requires: function.requires.clone(),
                 return_type: function
                     .return_type
                     .clone()
                     .unwrap_or_else(|| Type::empty_tuple("__self".to_string())),
             },
         };
+
 
         let _ = symbol_table
             .add_symbol(
@@ -314,7 +334,6 @@ fn collect_and_resolve_state(
         for param in &function.params {
             let param_qname = QualifiedName::new(vec![
                 contract_name.to_string(),
-                state_name.to_string(),
                 function.name.clone(),
                 param.name.clone(),
             ]);
@@ -333,122 +352,114 @@ fn collect_and_resolve_state(
                 .map_err(|e| errors.push(e));
         }
 
-        let path_components = vec![state_name, &function.name];
+        let path_components = vec![contract_name, function.name.clone()];
         collect_and_resolve_block(
             &function.body,
-            contract_name,
             &path_components,
             symbol_table,
             errors,
-            valid_states,
         );
 
         // Pop function scope
         symbol_table.pop_scope();
-    }
+    
 }
 
 /// Validates function modifiers for correctness
-fn validate_modifiers(function: &Function) -> Modifier {
+fn validate_modifiers(function: &Function) -> Result<Modifier, MerakError> {
     let has_guarded = function.modifiers.contains(&Modifier::Guarded);
     let has_reentrant = function.modifiers.contains(&Modifier::Reentrant);
     let is_internal = function.visibility == Visibility::Internal;
 
     // Rule 1: guarded and reentrant are mutually exclusive
     if has_guarded && has_reentrant {
-        // return Err(MerakError::SemanticError(format!(
-        //     "Function '{}' cannot have both 'guarded' and 'reentrant' modifiers. \
-        //         These reentrancy modes are mutually exclusive at {}",
-        //     function.name, function.source_ref
-        // )));
-        panic!(
+        return Err(MerakError::SemanticError(format!(
             "Function '{}' cannot have both 'guarded' and 'reentrant' modifiers. \
-                These reentrancy modes are mutually exclusive at {}. ¡¡TODO: Make this an error!!",
+                These reentrancy modes are mutually exclusive at {}",
             function.name, function.source_ref
-        );
+        )));
+        // panic!(
+        //     "Function '{}' cannot have both 'guarded' and 'reentrant' modifiers. \
+        //         These reentrancy modes are mutually exclusive at {}. ¡¡TODO: Make this an error!!",
+        //     function.name, function.source_ref
+        // );
     }
 
     // Rule 2: guarded and reentrant only on external/entrypoint functions
     if is_internal && has_guarded {
-        // return Err(MerakError::SemanticError(format!(
-        //         "Internal function '{}' cannot have 'guarded' modifier. \
-        //         Reentrancy protection is only applicable to external functions and entrypoints at {}",
-        //         function.name, function.source_ref
-        //     )));
-        panic!(
+        return Err(MerakError::SemanticError(format!(
                 "Internal function '{}' cannot have 'guarded' modifier. \
-                Reentrancy protection is only applicable to external functions and entrypoints at {}. ¡¡TODO: Make this an error!!",
+                Reentrancy protection is only applicable to external functions and entrypoints at {}",
                 function.name, function.source_ref
-            );
+            )));
+        // panic!(
+        //         "Internal function '{}' cannot have 'guarded' modifier. \
+        //         Reentrancy protection is only applicable to external functions and entrypoints at {}. ¡¡TODO: Make this an error!!",
+        //         function.name, function.source_ref
+        //     );
     }
 
     if is_internal && has_reentrant {
-        // return Err(MerakError::SemanticError(format!(
-        //     "Internal function '{}' cannot have 'reentrant' modifier. \
-        //         Reentrancy control es only applicable to external functions and entrypoints at {}",
-        //     function.name, function.source_ref
-        // )));
-        panic!(
+        return Err(MerakError::SemanticError(format!(
             "Internal function '{}' cannot have 'reentrant' modifier. \
-                Reentrancy control is only applicable to external functions and entrypoints at {}. ¡¡TODO: Make this an error!!",
+                Reentrancy control es only applicable to external functions and entrypoints at {}",
             function.name, function.source_ref
-        );
+        )));
+        // panic!(
+        //     "Internal function '{}' cannot have 'reentrant' modifier. \
+        //         Reentrancy control is only applicable to external functions and entrypoints at {}. ¡¡TODO: Make this an error!!",
+        //     function.name, function.source_ref
+        // );
     }
 
     // Rule 3: Check for duplicate modifiers
     let mut seen_modifiers = std::collections::HashSet::new();
     for modifier in &function.modifiers {
         if !seen_modifiers.insert(modifier) {
-            // return Err(MerakError::SemanticError(format!(
-            //     "Function '{}' has duplicate modifier '{:?}' at {}",
-            //     function.name, modifier, function.source_ref
-            // )));
-            panic!(
-                "Function '{}' has duplicate modifier '{:?}' at {}. ¡¡TODO: Make this an error!!",
+            return Err(MerakError::SemanticError(format!(
+                "Function '{}' has duplicate modifier '{:?}' at {}",
                 function.name, modifier, function.source_ref
-            );
+            )));
+            // panic!(
+            //     "Function '{}' has duplicate modifier '{:?}' at {}. ¡¡TODO: Make this an error!!",
+            //     function.name, modifier, function.source_ref
+            // );
         }
     }
 
     if seen_modifiers.len() == 0 {
-        Modifier::Checked
+        Ok(Modifier::Checked)
     } else if seen_modifiers.len() == 1 {
-        seen_modifiers.into_iter().next().unwrap().clone()
+        Ok(seen_modifiers.into_iter().next().unwrap().clone())
     } else {
-        panic!(
+        Err(MerakError::SemanticError(format!(
             "Function '{}' has more than one unique modifier at {}",
             function.name, function.source_ref
-        )
+        )))
     }
 }
 
 fn collect_and_resolve_block(
     block: &Block,
-    contract_name: &str,
-    path: &[&str],
+    path: &Vec<String>,
     symbol_table: &mut SymbolTable,
     errors: &mut Vec<MerakError>,
-    valid_states: &[String],
 ) {
     for statement in &block.statements {
         collect_and_resolve_statement(
             statement,
-            contract_name,
             path,
             symbol_table,
             errors,
-            valid_states,
         );
     }
 }
 
 fn collect_and_resolve_statement(
     statement: &Statement,
-    contract_name: &str,
-    path: &[&str],
+    path: &Vec<String>,
     symbol_table: &mut SymbolTable,
     errors: &mut Vec<MerakError>,
-    valid_states: &[String],
 ) {
     match statement {
         Statement::VarDeclaration {
@@ -464,10 +475,12 @@ fn collect_and_resolve_statement(
 
             resolve_names_in_expression(expr, symbol_table, errors);
 
-            let mut parts = vec![contract_name.to_string()];
-            parts.extend(path.iter().map(|s| s.to_string()));
-            parts.push(name.clone());
-            let var_qname = QualifiedName::new(parts);
+            let var_qname = QualifiedName::new(
+                path.iter()
+                    .cloned()
+                    .chain(std::iter::once(name.clone()))
+                    .collect()
+            );
             let _ = symbol_table
                 .add_symbol(*id, var_qname, SymbolKind::LocalVar, ty.clone()) // Asumo LocalVar o similar
                 .map_err(|e| errors.push(e));
@@ -484,10 +497,12 @@ fn collect_and_resolve_statement(
             }
             resolve_names_in_expression(expr, symbol_table, errors);
 
-            let mut parts = vec![contract_name.to_string()];
-            parts.extend(path.iter().map(|s| s.to_string()));
-            parts.push(name.clone());
-            let const_qname = QualifiedName::new(parts);
+            let const_qname = QualifiedName::new(
+                path.iter()
+                    .cloned()
+                    .chain(std::iter::once(name.clone()))
+                    .collect()
+            );
             let _ = symbol_table
                 .add_symbol(*id, const_qname, SymbolKind::LocalVar, ty.clone()) // Asumo LocalVar o similar
                 .map_err(|e| errors.push(e));
@@ -521,11 +536,9 @@ fn collect_and_resolve_statement(
             symbol_table.push_scope();
             collect_and_resolve_block(
                 then_block,
-                contract_name,
                 path,
                 symbol_table,
                 errors,
-                valid_states,
             );
             symbol_table.pop_scope();
 
@@ -533,11 +546,9 @@ fn collect_and_resolve_statement(
                 symbol_table.push_scope();
                 collect_and_resolve_block(
                     else_blk,
-                    contract_name,
                     path,
                     symbol_table,
                     errors,
-                    valid_states,
                 );
                 symbol_table.pop_scope();
             }
@@ -550,30 +561,11 @@ fn collect_and_resolve_statement(
             symbol_table.push_scope();
             collect_and_resolve_block(
                 body,
-                contract_name,
                 path,
                 symbol_table,
                 errors,
-                valid_states,
             );
             symbol_table.pop_scope();
-        }
-        Statement::Become(target_state, id, source_ref) => {
-            if !valid_states.contains(target_state) {
-                errors.push(MerakError::UndefinedState {
-                    state: target_state.clone(),
-                    source_ref: source_ref.clone(),
-                });
-            }
-            if symbol_table
-                .resolve_reference(*id, target_state, SymbolNamespace::Type)
-                .is_none()
-            {
-                errors.push(MerakError::UndefinedState {
-                    state: target_state.clone(),
-                    source_ref: source_ref.clone(),
-                });
-            }
         }
         Statement::Return(expr, ..) => {
             if let Some(ref return_expr) = expr {
@@ -593,7 +585,6 @@ fn resolve_names_in_expression(
 ) {
     match expr {
         Expression::Identifier(name, id, source_ref) => {
-            // Resolve variable reference
             if symbol_table
                 .resolve_reference(*id, name, SymbolNamespace::Value)
                 .is_none()
@@ -610,17 +601,19 @@ fn resolve_names_in_expression(
             id,
             source_ref,
         } => {
-            // Resolve function reference
+
             if symbol_table
-                .resolve_reference(*id, name, SymbolNamespace::Callable)
+                .resolve_reference(*id, name, SymbolNamespace::Callable) 
                 .is_none()
             {
-                errors.push(MerakError::UndefinedFunction {
-                    name: name.clone(),
-                    source_ref: source_ref.clone(),
-                });
+                if symbol_table.resolve_reference(*id, name, SymbolNamespace::Type).is_none() {
+                    println!("Symbol table {:?}", symbol_table);
+                    errors.push(MerakError::UndefinedFunction {
+                        name: name.clone(),
+                        source_ref: source_ref.clone(),
+                    });
+                }
             }
-            // Resolve references in arguments
             for arg in args {
                 resolve_names_in_expression(arg, symbol_table, errors);
             }
@@ -632,12 +625,23 @@ fn resolve_names_in_expression(
         Expression::UnaryOp { expr: inner, .. } => {
             resolve_names_in_expression(inner, symbol_table, errors);
         }
-        Expression::Literal(..) => {
-            // Literals don't reference symbols
+        Expression::Literal(lit, id, ..) => {
+            // match lit {
+            //     Literal::Integer(_) => todo!(),
+            //     Literal::Address(_) => todo!(),
+            //     Literal::Boolean(_) => todo!(),
+            //     Literal::String(_) => todo!(),
+            // }
         }
         Expression::Grouped(inner, ..) => {
-            // Resolve the grouped expression
             resolve_names_in_expression(inner, symbol_table, errors);
+        }
+        Expression::MemberCall { object, args, .. } => {
+            resolve_names_in_expression(object, symbol_table, errors);
+    
+            for arg in args {
+                resolve_names_in_expression(arg, symbol_table, errors);
+            }
         }
     }
 }

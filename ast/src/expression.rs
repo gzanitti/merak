@@ -29,6 +29,13 @@ pub enum Expression {
         id: NodeId,
         source_ref: SourceRef,
     },
+    MemberCall {
+        object: Box<Expression>,
+        method: String,
+        args: Vec<Expression>,
+        id: NodeId,
+        source_ref: SourceRef,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -72,6 +79,7 @@ impl Expression {
             Expression::UnaryOp { id, .. } => *id,
             Expression::Grouped(_, id, _) => *id,
             Expression::FunctionCall { id, .. } => *id,
+            Expression::MemberCall {  id, .. } => *id,
         }
     }
 
@@ -84,6 +92,7 @@ impl Expression {
             Expression::UnaryOp { source_ref, .. } => source_ref,
             Expression::Grouped(_, _, sr) => sr,
             Expression::FunctionCall { source_ref, .. } => source_ref,
+            Expression::MemberCall { source_ref, .. } => source_ref,
         }
     }
 
@@ -139,6 +148,15 @@ impl Expression {
                 id: *id,
                 source_ref: source_ref.clone(),
             },
+            Expression::MemberCall { object, method, args, id, source_ref } => {
+                Expression::MemberCall {
+                    object: Box::new(object.substitute_identifiers(stacks)),
+                    method: method.clone(),
+                    args: args.iter().map(|arg| arg.substitute_vars(stacks)).collect(),
+                    id: *id,
+                    source_ref: source_ref.clone(),
+                }
+            }
         }
     }
 
@@ -205,6 +223,18 @@ impl Expression {
                 id: *id,
                 source_ref: source_ref.clone(),
             },
+            Expression::MemberCall { object, method, args, id, source_ref } => {
+                Expression::MemberCall {
+                    object: Box::new(object.substitute_identifiers(mapping)),
+                    method: method.clone(),
+                    args: args
+                        .iter()
+                        .map(|arg| arg.substitute_identifiers(mapping))
+                        .collect(),
+                    id: *id,
+                    source_ref: source_ref.clone(),
+                }
+            }
         }
     }
 
@@ -226,63 +256,70 @@ impl Expression {
                 }
                 vars
             }
+            Expression::MemberCall { object, method, args, .. } => {
+                let mut vars = object.get_used_vars();
+                for arg in args {
+                    vars.extend(arg.get_used_vars());
+                }
+                vars
+            }
         }
     }
 
-    pub fn rename_placeholder_vars(&self, new_name: &str) -> Expression {
-        match self {
-            Expression::Literal(lit, id, sr) => Expression::Literal(lit.clone(), *id, sr.clone()),
-            Expression::Identifier(name, id, sr) if name.starts_with("__merak_infer_") => {
-                Expression::Identifier(new_name.to_string(), *id, sr.clone())
-            }
-            Expression::Identifier(name, id, sr) => {
-                Expression::Identifier(name.clone(), *id, sr.clone())
-            }
-            Expression::BinaryOp {
-                left,
-                op,
-                right,
-                id,
-                source_ref,
-            } => Expression::BinaryOp {
-                left: Box::new(left.rename_placeholder_vars(new_name)),
-                op: op.clone(),
-                right: Box::new(right.rename_placeholder_vars(new_name)),
-                id: *id,
-                source_ref: source_ref.clone(),
-            },
-            Expression::UnaryOp {
-                op,
-                expr,
-                id,
-                source_ref,
-            } => Expression::UnaryOp {
-                op: op.clone(),
-                expr: Box::new(expr.rename_placeholder_vars(new_name)),
-                id: *id,
-                source_ref: source_ref.clone(),
-            },
-            Expression::Grouped(inner, id, sr) => Expression::Grouped(
-                Box::new(inner.rename_placeholder_vars(new_name)),
-                *id,
-                sr.clone(),
-            ),
-            Expression::FunctionCall {
-                name,
-                args,
-                id,
-                source_ref,
-            } => Expression::FunctionCall {
-                name: name.clone(),
-                args: args
-                    .iter()
-                    .map(|arg| arg.rename_placeholder_vars(new_name))
-                    .collect(),
-                id: *id,
-                source_ref: source_ref.clone(),
-            },
-        }
-    }
+    // pub fn rename_placeholder_vars(&self, new_name: &str) -> Expression {
+    //     match self {
+    //         Expression::Literal(lit, id, sr) => Expression::Literal(lit.clone(), *id, sr.clone()),
+    //         Expression::Identifier(name, id, sr) if name.starts_with("__merak_infer_") => {
+    //             Expression::Identifier(new_name.to_string(), *id, sr.clone())
+    //         }
+    //         Expression::Identifier(name, id, sr) => {
+    //             Expression::Identifier(name.clone(), *id, sr.clone())
+    //         }
+    //         Expression::BinaryOp {
+    //             left,
+    //             op,
+    //             right,
+    //             id,
+    //             source_ref,
+    //         } => Expression::BinaryOp {
+    //             left: Box::new(left.rename_placeholder_vars(new_name)),
+    //             op: op.clone(),
+    //             right: Box::new(right.rename_placeholder_vars(new_name)),
+    //             id: *id,
+    //             source_ref: source_ref.clone(),
+    //         },
+    //         Expression::UnaryOp {
+    //             op,
+    //             expr,
+    //             id,
+    //             source_ref,
+    //         } => Expression::UnaryOp {
+    //             op: op.clone(),
+    //             expr: Box::new(expr.rename_placeholder_vars(new_name)),
+    //             id: *id,
+    //             source_ref: source_ref.clone(),
+    //         },
+    //         Expression::Grouped(inner, id, sr) => Expression::Grouped(
+    //             Box::new(inner.rename_placeholder_vars(new_name)),
+    //             *id,
+    //             sr.clone(),
+    //         ),
+    //         Expression::FunctionCall {
+    //             name,
+    //             args,
+    //             id,
+    //             source_ref,
+    //         } => Expression::FunctionCall {
+    //             name: name.clone(),
+    //             args: args
+    //                 .iter()
+    //                 .map(|arg| arg.rename_placeholder_vars(new_name))
+    //                 .collect(),
+    //             id: *id,
+    //             source_ref: source_ref.clone(),
+    //         },
+    //     }
+    // }
 }
 
 impl fmt::Display for Expression {
@@ -302,6 +339,10 @@ impl fmt::Display for Expression {
             Expression::FunctionCall { name, args, .. } => {
                 let args_str: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
                 write!(f, "{}({})", name, args_str.join(", "))
+            }
+            Expression::MemberCall { object, method, args, .. } => {
+                let args_str: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+                write!(f, "{}.{}({})", object, method, args_str.join(", "))
             }
         }
     }

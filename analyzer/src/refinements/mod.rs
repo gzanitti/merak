@@ -3,11 +3,9 @@ use merak_ir::ssa_ir::SsaCfg;
 use merak_symbols::SymbolTable;
 use z3::{Config, Context};
 
-use crate::refinements::inference::LiquidInferenceEngine;
-
 mod constraints;
 mod environment;
-mod inference;
+pub mod inference;
 mod qualifiers;
 mod smt;
 mod solver;
