@@ -27,11 +27,11 @@ impl CallGraphAnalysis {
         for cfg in &contract.functions {
             let mut visited = HashSet::new();
             if Self::contains_external_calls_recursive(
-                cfg.function_id,
+                &cfg.function_id,
                 contract,
                 &mut visited,
             ) {
-                analysis.functions_with_external_calls.insert(cfg.function_id);
+                analysis.functions_with_external_calls.insert(cfg.function_id.clone());
             }
         }
         
@@ -39,13 +39,13 @@ impl CallGraphAnalysis {
     }
     
     /// Query: Does this function contain external calls?
-    pub fn contains_external_calls(&self, fn_id: SymbolId) -> bool {
+    pub fn contains_external_calls(&self, fn_id: &SymbolId) -> bool {
         self.functions_with_external_calls.contains(&fn_id)
     }
     
     /// Recursive helper: Check if function contains external calls transitively
     fn contains_external_calls_recursive(
-        fn_id: SymbolId,
+        fn_id: &SymbolId,
         contract: &SsaContract,
         visited: &mut HashSet<SymbolId>,
     ) -> bool {
@@ -53,11 +53,11 @@ impl CallGraphAnalysis {
         if visited.contains(&fn_id) {
             return false;
         }
-        visited.insert(fn_id);
+        visited.insert(fn_id.clone());
         
         // Find the function's CFG
         let cfg = contract.functions.iter()
-            .find(|f| f.function_id == fn_id)
+            .find(|f| f.function_id == *fn_id)
             .expect("Function must exist in contract");
         
         // Check all instructions in all blocks
@@ -79,7 +79,7 @@ impl CallGraphAnalysis {
                     } => {
                         // Check if the callee contains external calls
                         if Self::contains_external_calls_recursive(
-                            *callee_id,
+                            callee_id,
                             contract,
                             visited,
                         ) {
@@ -105,20 +105,44 @@ pub fn analyze_storage(
 
     let call_graph = CallGraphAnalysis::analyze(contract);
 
-    let storage_states = compute_storage_states(cfg, symbol_table, &call_graph)?;
-    
+    let storage_states = compute_storage_states(cfg, /*symbol_table,*/ &call_graph)?;
+
     insert_fold_unfold_instructions(cfg, &storage_states, &locations, symbol_table, &call_graph);
-    
+
     validate_cei_pattern(cfg, &symbol_table)?;
     validate_immutability(cfg, &locations)?;
-    
+
+    Ok(())
+}
+
+/// Analyze storage for all functions in a contract.
+///
+/// Computes the call graph and storage locations once (contract-level),
+/// then runs per-function analysis for each function in the contract.
+pub fn analyze_storage_contract(
+    contract: &mut SsaContract,
+    symbol_table: &SymbolTable,
+) -> Result<(), MerakError> {
+    // Compute contract-level data. Both calls take `&SsaContract` (via auto-deref
+    // of `&mut`) and return owned values, so the borrow is released immediately.
+    let locations = StorageLocationSet::from_contract(contract, symbol_table);
+    let call_graph = CallGraphAnalysis::analyze(contract);
+
+    // Now mutably iterate over functions — no aliased borrows remain.
+    for cfg in &mut contract.functions {
+        let storage_states = compute_storage_states(cfg, &call_graph)?;
+        insert_fold_unfold_instructions(cfg, &storage_states, &locations, symbol_table, &call_graph);
+        validate_cei_pattern(cfg, symbol_table)?;
+        validate_immutability(cfg, &locations)?;
+    }
+
     Ok(())
 }
 
 // TODO: Implementar en StorageStateMap
 pub fn compute_storage_states(
     cfg: &SsaCfg,
-    symbol_table: &SymbolTable,
+    //symbol_table: &SymbolTable,
     call_graph: &CallGraphAnalysis,
 ) -> Result<StorageStateMap, MerakError> {
     let mut storage_states = StorageStateMap::new();
@@ -140,7 +164,7 @@ pub fn compute_storage_states(
         let block_exit_state = apply_transfer_function(
             &block_entry_state,
             &block.instructions,
-            symbol_table,
+            //symbol_table,
             call_graph
         );
 
@@ -156,7 +180,7 @@ pub fn compute_storage_states(
 fn apply_transfer_function(
     block_entry_state: &StorageState,
     instructions: &[SsaInstruction],
-    symbol_table: &SymbolTable,
+    //symbol_table: &SymbolTable,
     call_graph: &CallGraphAnalysis
 ) -> StorageState {
     let mut new_entry_state = block_entry_state.clone();
@@ -167,25 +191,25 @@ fn apply_transfer_function(
                 var,
                 source_ref: _,
             } => {
-                new_entry_state.unfold(*var);
+                new_entry_state.unfold(var);
             }
             SsaInstruction::StorageStore {
                 var,
                 value: _,
                 source_ref: _,
-            } => new_entry_state.fold(*var),
+            } => new_entry_state.fold(var),
             SsaInstruction::Call { target: CallTarget::External { .. }, .. } => {
                 new_entry_state.fold_all();
             }
             SsaInstruction::Call {
                 target: CallTarget::Internal(fn_id), ..
             } => {
-                let symbol_info = symbol_table.get_symbol(*fn_id);
+                //let symbol_info = symbol_table.get_symbol(fn_id);
                 //let reentrancy = get_reentrancy_modifier(*fn_id, symbol_table);
 
                 // TODO: Check contract
                 //*reentrancy == Modifier::Reentrant ||
-                if call_graph.contains_external_calls(*fn_id) {
+                if call_graph.contains_external_calls(fn_id) {
                     new_entry_state.fold_all();
                 } 
             }
@@ -210,14 +234,14 @@ fn insert_fold_unfold_instructions(
         
         for instruction in &block.instructions {
             match instruction {
-                SsaInstruction::StorageLoad { dest, var, source_ref } => {
+                SsaInstruction::StorageLoad { dest: _, var, source_ref } => {
                     // If var is folded, insert unfold before load
-                    if current_state.is_folded(*var) {
+                    if current_state.is_folded(var) {
                         new_instructions.push(SsaInstruction::Unfold {
-                            var: *var,
+                            var: var.clone(),
                             source_ref: source_ref.clone(),
                         });
-                        current_state.unfold(*var);
+                        current_state.unfold(var);
                     }
                     
                     // Insert original load
@@ -225,14 +249,14 @@ fn insert_fold_unfold_instructions(
                     // var stays unfolded
                 }
                 
-                SsaInstruction::StorageStore { var, value, source_ref } => {
+                SsaInstruction::StorageStore { var, value: _, source_ref } => {
                     // If var is folded, insert unfold before store
-                    if current_state.is_folded(*var) {
+                    if current_state.is_folded(var) {
                         new_instructions.push(SsaInstruction::Unfold {
-                            var: *var,
+                            var: var.clone(),
                             source_ref: source_ref.clone(),
                         });
-                        current_state.unfold(*var);
+                        current_state.unfold(var);
                     }
                     
                     // Insert original store
@@ -240,27 +264,26 @@ fn insert_fold_unfold_instructions(
                     
                     // Insert fold after store
                     new_instructions.push(SsaInstruction::Fold {
-                        var: *var,
+                        var: var.clone(),
                         source_ref: source_ref.clone(),
                     });
-                    current_state.fold(*var);
+                    current_state.fold(var);
                 }
                 
                 SsaInstruction::Call { 
-                    dest, 
-                    target: CallTarget::External { object, method }, 
-                    args, 
-                    source_ref 
+                    target: CallTarget::External { .. }, 
+                    source_ref,
+                    .. 
                 } => {
                     // PRE-CALL: Unfold all MUTABLE storage vars
                     for (var_id, location) in locations.iter() {
                         if location.mutability == StorageMutability::Mutable 
-                           && current_state.is_folded(*var_id) {
+                           && current_state.is_folded(var_id) {
                             new_instructions.push(SsaInstruction::Unfold {
-                                var: *var_id,
+                                var: var_id.clone(),
                                 source_ref: source_ref.clone(),
                             });
-                            current_state.unfold(*var_id);
+                            current_state.unfold(var_id);
                         }
                     }
                     
@@ -270,12 +293,12 @@ fn insert_fold_unfold_instructions(
                     // POST-CALL: Fold all UNFOLDED vars
                     for (var_id, location) in locations.iter() {
                         if location.mutability == StorageMutability::Mutable 
-                           && current_state.is_unfolded(*var_id) {
+                           && current_state.is_unfolded(var_id) {
                             new_instructions.push(SsaInstruction::Fold {
-                                var: *var_id,
+                                var: var_id.clone(),
                                 source_ref: source_ref.clone(),
                             });
-                            current_state.fold(*var_id);
+                            current_state.fold(var_id);
                         }
                     }
                 }
@@ -285,10 +308,10 @@ fn insert_fold_unfold_instructions(
                     source_ref,
                     ..
                 } => {
-                    let reentrancy = get_reentrancy_modifier(*fn_id, symbol_table);
+                    let reentrancy = get_reentrancy_modifier(fn_id, symbol_table);
 
-                    let needs_fold_unfold = *reentrancy == Modifier::Reentrant 
-                        || call_graph.contains_external_calls(*fn_id);
+                    let needs_fold_unfold = reentrancy == Modifier::Reentrant 
+                        || call_graph.contains_external_calls(fn_id);
                     
                     
                     if needs_fold_unfold {
@@ -297,12 +320,12 @@ fn insert_fold_unfold_instructions(
                         // PRE-CALL: Unfold all mutable storage vars
                         for (var_id, location) in locations.iter() {
                             if location.mutability == StorageMutability::Mutable 
-                               && current_state.is_folded(*var_id) {
+                               && current_state.is_folded(var_id) {
                                 new_instructions.push(SsaInstruction::Unfold {
-                                    var: *var_id,
+                                    var: var_id.clone(),
                                     source_ref: source_ref.clone(),
                                 });
-                                current_state.unfold(*var_id);
+                                current_state.unfold(var_id);
                             }
                         }
                         
@@ -312,12 +335,12 @@ fn insert_fold_unfold_instructions(
                         // POST-CALL: Fold all unfolded vars
                         for (var_id, location) in locations.iter() {
                             if location.mutability == StorageMutability::Mutable 
-                               && current_state.is_unfolded(*var_id) {
+                               && current_state.is_unfolded(var_id) {
                                 new_instructions.push(SsaInstruction::Fold {
-                                    var: *var_id,
+                                    var: var_id.clone(),
                                     source_ref: source_ref.clone(),
                                 });
-                                current_state.fold(*var_id);
+                                current_state.fold(var_id);
                             }
                         }
                     } else {
@@ -334,9 +357,9 @@ fn insert_fold_unfold_instructions(
         
         // CLEANUP: Fold any remaining unfolded vars at end of block
         for (var_id, _) in locations.iter() {
-            if current_state.is_unfolded(*var_id) {
+            if current_state.is_unfolded(var_id) {
                 new_instructions.push(SsaInstruction::Fold {
-                    var: *var_id,
+                    var: var_id.clone(),
                     source_ref: SourceRef::unknown(),
                 });
             }
@@ -352,9 +375,9 @@ fn validate_cei_pattern(
     symbol_table: &SymbolTable,
 ) -> Result<(), MerakError> {
     // Only validate if the function is Checked (default)
-    let reentrancy = get_reentrancy_modifier(cfg.function_id, symbol_table);
+    let reentrancy = get_reentrancy_modifier(&cfg.function_id, symbol_table);
     
-    if *reentrancy != Modifier::Checked {
+    if reentrancy != Modifier::Checked {
         // Reentrant: user handles it
         // Guarded: runtime guard handles it
         return Ok(());
@@ -371,8 +394,8 @@ fn validate_cei_pattern(
             
             // Also check internal calls with Reentrant modifier
             if let SsaInstruction::Call { target: CallTarget::Internal(fn_id), source_ref, .. } = instr {
-                let call_reentrancy = get_reentrancy_modifier(*fn_id, symbol_table);
-                if *call_reentrancy == Modifier::Reentrant {
+                let call_reentrancy = get_reentrancy_modifier(fn_id, symbol_table);
+                if call_reentrancy == Modifier::Reentrant {
                     check_no_stores_after_call(cfg, *block_id, idx, source_ref)?;
                 }
             }
@@ -431,10 +454,10 @@ fn validate_immutability(
     cfg: &SsaCfg,
     locations: &StorageLocationSet,
 ) -> Result<(), MerakError> {
-    for (block_id, block) in &cfg.blocks {
+    for (_, block) in &cfg.blocks {
         for instr in &block.instructions {
             if let SsaInstruction::StorageStore { var, source_ref, .. } = instr {
-                let location = locations.get(*var).unwrap();
+                let location = locations.get(var).unwrap();
                 
                 if location.mutability == StorageMutability::Immutable {
                     return Err(MerakError::WriteToImmutable {
@@ -449,10 +472,10 @@ fn validate_immutability(
     Ok(())
 }
 
-fn get_reentrancy_modifier(fn_id: SymbolId, symbol_table: &SymbolTable) -> &Modifier {
+fn get_reentrancy_modifier(fn_id: &SymbolId, symbol_table: &SymbolTable) -> Modifier {
     let symbol_info = symbol_table.get_symbol(fn_id);
     match &symbol_info.kind {
-        SymbolKind::Function { reentrancy, .. } | SymbolKind::Entrypoint { reentrancy, .. } => reentrancy,
+        SymbolKind::Function { reentrancy, .. } | SymbolKind::Entrypoint { reentrancy, .. } => reentrancy.clone(),
         _ => panic!("Unsupported function kind for storage analysis: {:?}", symbol_info.kind),
     }
 }
@@ -487,7 +510,7 @@ impl StorageLocationSet {
             let symbol_id = symbol_table.get_symbol_id_by_node_id(state_var.id).unwrap();
             let symbol_info = symbol_table.get_symbol_by_node_id(state_var.id).unwrap();
             locations.insert(
-                symbol_id,
+                symbol_id.clone(),
                 StorageLocation {
                     symbol: symbol_id,
                     refined_type: symbol_info
@@ -507,7 +530,7 @@ impl StorageLocationSet {
                 .unwrap();
             let symbol_info = symbol_table.get_symbol_by_node_id(state_const.id).unwrap();
             locations.insert(
-                symbol_id,
+                symbol_id.clone(),
                 StorageLocation {
                     symbol: symbol_id,
                     refined_type: symbol_info
@@ -524,12 +547,12 @@ impl StorageLocationSet {
         StorageLocationSet { locations }
     }
 
-    pub fn get(&self, symbol_id: SymbolId) -> Option<&StorageLocation> {
-        self.locations.get(&symbol_id)
+    pub fn get(&self, symbol_id: &SymbolId) -> Option<&StorageLocation> {
+        self.locations.get(symbol_id)
     }
 
-    pub fn is_storage(&self, symbol_id: SymbolId) -> bool {
-        self.locations.contains_key(&symbol_id)
+    pub fn is_storage(&self, symbol_id: &SymbolId) -> bool {
+        self.locations.contains_key(symbol_id)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&SymbolId, &StorageLocation)> {
@@ -560,26 +583,26 @@ impl StorageState {
         }
     }
     
-    pub fn is_folded(&self, loc: SymbolId) -> bool {
-        !self.unfolded.contains(&loc)
+    pub fn is_folded(&self, loc: &SymbolId) -> bool {
+        !self.unfolded.contains(loc)
     }
     
-    pub fn is_unfolded(&self, loc: SymbolId) -> bool {
-        self.unfolded.contains(&loc)
+    pub fn is_unfolded(&self, loc: &SymbolId) -> bool {
+        self.unfolded.contains(loc)
     }
     
-    pub fn unfold(&mut self, loc: SymbolId) {
-        self.unfolded.insert(loc);
+    pub fn unfold(&mut self, loc: &SymbolId) {
+        self.unfolded.insert(loc.clone());
     }
     
-    pub fn fold(&mut self, loc: SymbolId) {
-        self.unfolded.remove(&loc);
+    pub fn fold(&mut self, loc: &SymbolId) {
+        self.unfolded.remove(loc);
     }
     
     pub fn unfold_all_mutable(&mut self, locations: &StorageLocationSet) {
         for (var_id, location) in locations.iter() {
             if location.mutability == StorageMutability::Mutable {
-                self.unfolded.insert(*var_id);
+                self.unfolded.insert(var_id.clone());
             }
         }
     }
@@ -593,7 +616,7 @@ impl StorageState {
         // Conservative: only unfolded if unfolded in BOTH paths
         let unfolded = self.unfolded
             .intersection(&other.unfolded)
-            .copied()
+            .cloned()
             .collect();
         
         StorageState { unfolded }

@@ -209,7 +209,7 @@ States: Vec<String> = {
 StateVar: StateVar = {
     <start:@L> "state" "var" <name:Ident> ":" <ty:TypeWithNamedBinder> "=" <expr:Expression> ";" <end:@R> => {
         let mut updated_ty = ty;
-        if updated_ty.binder == "_self" {
+        if updated_ty.binder == "__self" {
             updated_ty.binder = name.clone();
         }
         StateVar { name, ty: updated_ty, expr, id: id_gen.next(), source_ref: SourceRef::new(start, end) }
@@ -219,7 +219,7 @@ StateVar: StateVar = {
 StateConst: StateConst = {
     <start:@L> "state" "const" <name:Ident> ":" <ty:TypeWithNamedBinder> "=" <expr:Expression> ";" <end:@R> => {
         let mut updated_ty = ty;
-        if updated_ty.binder == "_self" {
+        if updated_ty.binder == "__self" {
             updated_ty.binder = name.clone();
         }
         StateConst { name, ty: updated_ty, expr, id: id_gen.next(), source_ref: SourceRef::new(start, end) }
@@ -307,7 +307,7 @@ FnModifier: Modifier = {
 Param: Param = {
     <start:@L> <name:Ident> ":" <ty: TypeWithNamedBinder> <end:@R> => {
         let mut updated_ty = ty;
-        if updated_ty.binder == "_self" {
+        if updated_ty.binder == "__self" {
             updated_ty.binder = name.clone();
         }
         Param { name, ty: updated_ty, id: id_gen.next(), source_ref: SourceRef::new(start, end) }
@@ -327,10 +327,10 @@ TypeWithNamedBinder: Type = {
         Type { base: base_type, binder: explicit_binder, constraint, explicit_annotation: true, source_ref: SourceRef::new(start, end) }
     },
     <start:@L>"{" <base_type:BaseType> "|" <constraint:Predicate> "}" <end:@R> => {
-        Type { base: base_type, binder: "_self".to_string(), constraint, explicit_annotation: true, source_ref: SourceRef::new(start, end) }
+        Type { base: base_type, binder: "__self".to_string(), constraint, explicit_annotation: true, source_ref: SourceRef::new(start, end) }
     },
     <start:@L><base_type:BaseType><end:@R> => {
-        Type { base: base_type, binder: "_self".to_string(), constraint: Predicate::True(id_gen.next(), SourceRef::new(start, end)), explicit_annotation: true, source_ref: SourceRef::new(start, end) }
+        Type { base: base_type, binder: "__self".to_string(), constraint: Predicate::True(id_gen.next(), SourceRef::new(start, end)), explicit_annotation: true, source_ref: SourceRef::new(start, end) }
     },
 };
 
@@ -372,7 +372,7 @@ Statement: Statement = {
     <start:@L>"var" <name:Ident> <ty:(":" <TypeWithNamedBinder>)?> "=" <expr:Expression> ";"<end:@R> => {
         let updated_ty = match ty {
             Some(mut t) => {
-                if t.binder == "_self" {
+                if t.binder == "__self" {
                     t.binder = name.clone();
                 }
                 Some(t)
@@ -392,7 +392,7 @@ Statement: Statement = {
     <start:@L>"const" <name:Ident> <ty:(":" <TypeWithNamedBinder>)?> "=" <expr:Expression> ";"<end:@R> => {
         let updated_ty = match ty {
             Some(mut t) => {
-                if t.binder == "_self" {
+                if t.binder == "__self" {
                     t.binder = name.clone();
                 }
                 Some(t)
@@ -627,7 +627,8 @@ ComparisonPred: Predicate = {
                 match lhs {
                     RefinementExpr::Var(id, node_id, sr) => Predicate::Var(id, node_id, sr),
                     RefinementExpr::UninterpFn { name, args, id, source_ref } => Predicate::UninterpFnCall{name, args, id, source_ref},
-
+                    RefinementExpr::BoolLit(true, id, sr) => Predicate::True(id, sr),
+                    RefinementExpr::BoolLit(false, id, sr) => Predicate::False(id, sr),
                     _ => panic!("Syntax error: Expected a comparison or a boolean variable, but found an arithmetic expression."),
                 }
             }
@@ -650,8 +651,8 @@ ComparisonOpPred: RelOp = {
 };
 
 PredicatePrimary: Predicate = {
-    <start:@L>"true"<end:@R> => Predicate::True(id_gen.next(), SourceRef::new(start, end)),
-    <start:@L>"false"<end:@R> => Predicate::False(id_gen.next(), SourceRef::new(start, end)),
+    // true/false se manejan en RefinementPrimary como BoolLit y se convierten
+    // a Predicate::True/False en ComparisonPred para evitar ambigüedad
     <start:@L>"!" <pred:PredicatePrimary><end:@R> => Predicate::Not(Box::new(pred), id_gen.next(), SourceRef::new(start, end)),
     "(" <Predicate> ")",
 };
@@ -749,6 +750,9 @@ RefinementPrimary: RefinementExpr = {
     <start:@L><n:Integer><end:@R> => RefinementExpr::IntLit(n, id_gen.next(), SourceRef::new(start, end)),
 
     <start:@L><addr:Address><end:@R> => RefinementExpr::AddressLit(addr, id_gen.next(), SourceRef::new(start, end)),
+
+    <start:@L>"true"<end:@R> => RefinementExpr::BoolLit(true, id_gen.next(), SourceRef::new(start, end)),
+    <start:@L>"false"<end:@R> => RefinementExpr::BoolLit(false, id_gen.next(), SourceRef::new(start, end)),
 
     // msg.sender, block.timestamp, etc.
     <start:@L>"msg.sender"<end:@R> => RefinementExpr::MsgSender(id_gen.next(), SourceRef::new(start, end)),

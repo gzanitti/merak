@@ -4,6 +4,7 @@ use primitive_types::H256;
 
 use crate::meta::SourceRef;
 use crate::node_id::NodeId;
+use crate::predicate::{ArithOp, Predicate, RefinementExpr, RelOp};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Expression {
@@ -29,6 +30,9 @@ pub enum Expression {
         id: NodeId,
         source_ref: SourceRef,
     },
+    // Only for contract initialization for now.
+    // TODO: Add support for other types of expressions
+    // maybe in another expression type? parser?
     MemberCall {
         object: Box<Expression>,
         method: String,
@@ -256,12 +260,244 @@ impl Expression {
                 }
                 vars
             }
-            Expression::MemberCall { object, method, args, .. } => {
+            Expression::MemberCall { object, method: _, args, .. } => {
                 let mut vars = object.get_used_vars();
                 for arg in args {
                     vars.extend(arg.get_used_vars());
                 }
                 vars
+            }
+        }
+    }
+
+    /// Converts a boolean-typed Expression into a Predicate.
+    ///
+    /// This function assumes the expression has already been type-checked and is known
+    /// to evaluate to a boolean value. It is intended for use with branch conditions
+    /// in the refinement type system.
+    ///
+    /// # Panics
+    /// - If the expression contains a `MemberCall` (currently prohibited in conditions,
+    ///   see `typechecker::is_pure_logical`)
+    /// - If the expression contains non-boolean literals (Integer, Address, String)
+    ///   which should have been caught by the type checker
+    pub fn to_predicate(&self) -> Predicate {
+        let id = self.id();
+        let sr = self.source_ref().clone();
+
+        match self {
+            // Boolean literals map directly
+            Expression::Literal(Literal::Boolean(true), _, _) => Predicate::True(id, sr),
+            Expression::Literal(Literal::Boolean(false), _, _) => Predicate::False(id, sr),
+
+            // Non-boolean literals shouldn't appear in boolean context (type error)
+            Expression::Literal(lit, _, _) => {
+                panic!(
+                    "Non-boolean literal {:?} in boolean context - should have been caught by type checker",
+                    lit
+                )
+            }
+
+            // Identifiers become predicate variables
+            Expression::Identifier(name, _, _) => Predicate::Var(name.clone(), id, sr),
+
+            // Logical operators
+            Expression::BinaryOp {
+                left,
+                op: BinaryOperator::LogicalAnd,
+                right,
+                ..
+            } => Predicate::And(
+                Box::new(left.to_predicate()),
+                Box::new(right.to_predicate()),
+                id,
+                sr,
+            ),
+
+            Expression::BinaryOp {
+                left,
+                op: BinaryOperator::LogicalOr,
+                right,
+                ..
+            } => Predicate::Or(
+                Box::new(left.to_predicate()),
+                Box::new(right.to_predicate()),
+                id,
+                sr,
+            ),
+
+            // Comparison operators become BinRel
+            Expression::BinaryOp { left, op, right, .. } => {
+                let rel_op = match op {
+                    BinaryOperator::Equal => RelOp::Eq,
+                    BinaryOperator::NotEqual => RelOp::Neq,
+                    BinaryOperator::Less => RelOp::Lt,
+                    BinaryOperator::LessEqual => RelOp::Leq,
+                    BinaryOperator::Greater => RelOp::Gt,
+                    BinaryOperator::GreaterEqual => RelOp::Geq,
+                    // Arithmetic operators don't produce boolean results
+                    BinaryOperator::Add
+                    | BinaryOperator::Subtract
+                    | BinaryOperator::Multiply
+                    | BinaryOperator::Divide
+                    | BinaryOperator::Modulo => {
+                        panic!(
+                            "Arithmetic operator {:?} in boolean context - should have been caught by type checker",
+                            op
+                        )
+                    }
+                    // LogicalAnd/LogicalOr already handled above
+                    _ => unreachable!(),
+                };
+
+                Predicate::BinRel {
+                    op: rel_op,
+                    lhs: left.to_refinement_expr(),
+                    rhs: right.to_refinement_expr(),
+                    id,
+                    source_ref: sr,
+                }
+            }
+
+            // Unary Not
+            Expression::UnaryOp {
+                op: UnaryOperator::Not,
+                expr,
+                ..
+            } => Predicate::Not(Box::new(expr.to_predicate()), id, sr),
+
+            // Negate doesn't produce boolean
+            Expression::UnaryOp {
+                op: UnaryOperator::Negate,
+                ..
+            } => {
+                panic!("Negate operator in boolean context - should have been caught by type checker")
+            }
+
+            // Grouped expressions are transparent
+            Expression::Grouped(inner, _, _) => inner.to_predicate(),
+
+            // Function calls become uninterpreted function calls
+            Expression::FunctionCall { name, args, .. } => Predicate::UninterpFnCall {
+                name: name.clone(),
+                args: args.iter().map(|arg| arg.to_refinement_expr()).collect(),
+                id,
+                source_ref: sr,
+            },
+
+            // MemberCall is currently prohibited in conditions
+            // See typechecker::is_pure_logical which returns false for MemberCall
+            Expression::MemberCall { .. } => {
+                panic!(
+                    "MemberCall in predicate context is not supported yet. \
+                     This should have been rejected by the type checker (is_pure_logical)"
+                )
+            }
+        }
+    }
+
+    /// Converts an Expression into a RefinementExpr.
+    ///
+    /// This is used for operands within comparisons (e.g., the `x` and `y` in `x < y`).
+    /// RefinementExpr represents value expressions, not boolean predicates.
+    ///
+    /// # Panics
+    /// - If the expression contains a `MemberCall` (currently not supported)
+    /// - If the expression contains logical operators (LogicalAnd, LogicalOr, Not)
+    ///   which produce boolean values, not refinement expressions
+    pub fn to_refinement_expr(&self) -> RefinementExpr {
+        let id = self.id();
+        let sr = self.source_ref().clone();
+
+        match self {
+            // Literals
+            Expression::Literal(Literal::Integer(n), _, _) => RefinementExpr::IntLit(*n, id, sr),
+            Expression::Literal(Literal::Boolean(b), _, _) => RefinementExpr::BoolLit(*b, id, sr),
+            Expression::Literal(Literal::Address(addr), _, _) => {
+                RefinementExpr::AddressLit(format!("{:?}", addr), id, sr)
+            }
+            Expression::Literal(Literal::String(s), _, _) => {
+                panic!("String literals are not supported in refinement expressions: {}", s)
+            }
+
+            // Identifiers become variables
+            Expression::Identifier(name, _, _) => RefinementExpr::Var(name.clone(), id, sr),
+
+            // Arithmetic operators
+            Expression::BinaryOp { left, op, right, .. } => {
+                let arith_op = match op {
+                    BinaryOperator::Add => ArithOp::Add,
+                    BinaryOperator::Subtract => ArithOp::Sub,
+                    BinaryOperator::Multiply => ArithOp::Mul,
+                    BinaryOperator::Divide => ArithOp::Div,
+                    BinaryOperator::Modulo => ArithOp::Mod,
+                    // Comparison and logical operators don't produce value expressions
+                    BinaryOperator::Equal
+                    | BinaryOperator::NotEqual
+                    | BinaryOperator::Less
+                    | BinaryOperator::LessEqual
+                    | BinaryOperator::Greater
+                    | BinaryOperator::GreaterEqual
+                    | BinaryOperator::LogicalAnd
+                    | BinaryOperator::LogicalOr => {
+                        panic!(
+                            "Comparison/logical operator {:?} cannot be converted to RefinementExpr - \
+                             use to_predicate() for boolean expressions",
+                            op
+                        )
+                    }
+                };
+
+                RefinementExpr::BinOp {
+                    op: arith_op,
+                    lhs: Box::new(left.to_refinement_expr()),
+                    rhs: Box::new(right.to_refinement_expr()),
+                    id,
+                    source_ref: sr,
+                }
+            }
+
+            // Unary negate
+            Expression::UnaryOp {
+                op: UnaryOperator::Negate,
+                expr,
+                ..
+            } => RefinementExpr::UnaryOp {
+                op: crate::predicate::UnaryOp::Negate,
+                expr: Box::new(expr.to_refinement_expr()),
+                id,
+                source_ref: sr,
+            },
+
+            // Logical Not produces boolean, not a value
+            Expression::UnaryOp {
+                op: UnaryOperator::Not,
+                ..
+            } => {
+                panic!(
+                    "Logical Not cannot be converted to RefinementExpr - \
+                     use to_predicate() for boolean expressions"
+                )
+            }
+
+            // Grouped expressions are transparent
+            Expression::Grouped(inner, _, _) => inner.to_refinement_expr(),
+
+            // Function calls become uninterpreted functions
+            Expression::FunctionCall { name, args, .. } => RefinementExpr::UninterpFn {
+                name: name.clone(),
+                args: args.iter().map(|arg| arg.to_refinement_expr()).collect(),
+                id,
+                source_ref: sr,
+            },
+
+            // MemberCall is currently not supported in refinement expressions
+            // See typechecker::is_pure_logical which returns false for MemberCall
+            Expression::MemberCall { .. } => {
+                panic!(
+                    "MemberCall in refinement expression is not supported yet. \
+                     This should have been rejected by the type checker (is_pure_logical)"
+                )
             }
         }
     }

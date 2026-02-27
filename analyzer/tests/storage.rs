@@ -1,10 +1,5 @@
-use merak_analyzer::{analyze, storage::analyze_storage};
-use merak_ir::{
-    ssa_ir::{SsaInstruction, SsaProgram},
-    transformers::ssa::SsaBuilder,
-};
-use merak_symbols::SymbolTable;
 
+use merak_ir::ssa_ir::SsaInstruction;
 mod common;
 use common::*;
 
@@ -21,7 +16,7 @@ fn test_simple_storage_load() {
             }
         "#;
 
-    let (program, symbols) = build_ssa_with_storage(source).unwrap();
+    let (program, _) = build_ssa_with_storage(source).unwrap();
     let cfg = get_function_cfg(&program, "Test", "foo");
     let entry_block = &cfg.blocks[&cfg.entry];
 
@@ -67,7 +62,7 @@ fn test_simple_storage_write() {
             }
         "#;
 
-    let (program, symbols) = build_ssa_with_storage(source).unwrap();
+    let (program, _) = build_ssa_with_storage(source).unwrap();
     let cfg = get_function_cfg(&program, "Test", "foo");
     let entry_block = &cfg.blocks[&cfg.entry];
 
@@ -155,7 +150,7 @@ fn test_load_then_store_single_unfold() {
             }
         "#;
 
-    let (program, symbols) = build_ssa_with_storage(source).unwrap();
+    let (program, _) = build_ssa_with_storage(source).unwrap();
     let cfg = get_function_cfg(&program, "Test", "foo");
     let entry_block = &cfg.blocks[&cfg.entry];
 
@@ -198,7 +193,7 @@ fn test_external_call_multiple_storage_vars() {
         ),
     ];
 
-    let (program, symbols) = load_test_contracts_with_storage(contracts).unwrap();
+    let (program, _) = load_test_contracts_with_storage(contracts).unwrap();
     let cfg = get_function_cfg(&program, "Test", "foo");
     let entry_block = &cfg.blocks[&cfg.entry];
 
@@ -354,7 +349,7 @@ fn test_internal_with_external_call() {
         ),
     ];
 
-    let (program, symbols) = load_test_contracts_with_storage(contracts).unwrap();
+    let (program, _) = load_test_contracts_with_storage(contracts).unwrap();
     let cfg = get_function_cfg(&program, "Test", "foo");
 
     // Buscar el call a helper
@@ -427,7 +422,7 @@ fn test_internal_without_external_call() {
             }
         "#;
 
-    let (program, symbols) = build_ssa_with_storage(source).unwrap();
+    let (program, _) = build_ssa_with_storage(source).unwrap();
     let cfg = get_function_cfg(&program, "Test", "foo");
     let entry_block = &cfg.blocks[&cfg.entry];
 
@@ -530,7 +525,7 @@ fn test_nested_internal_calls() {
         ),
     ];
 
-    let (program, symbols) = load_test_contracts_with_storage(contracts).unwrap();
+    let (program, _) = load_test_contracts_with_storage(contracts).unwrap();
     let cfg = get_function_cfg(&program, "Test", "foo");
     let entry_block = &cfg.blocks[&cfg.entry];
 
@@ -587,7 +582,7 @@ fn test_multiple_consecutive_external_calls() {
         ),
     ];
 
-    let (program, symbols) = load_test_contracts_with_storage(contracts).unwrap();
+    let (program, _) = load_test_contracts_with_storage(contracts).unwrap();
     let entry_block = &program.files.get("Test").unwrap().contract.functions[0]
         .blocks
         .values()
@@ -638,7 +633,7 @@ fn test_const_not_unfolded_on_external_call() {
         ),
     ];
 
-    let (program, symbols) = load_test_contracts_with_storage(contracts).unwrap();
+    let (program, _) = load_test_contracts_with_storage(contracts).unwrap();
     let cfg = get_function_cfg(&program, "Test", "foo");
     let entry_block = &cfg.blocks[&cfg.entry];
 

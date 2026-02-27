@@ -9,15 +9,14 @@ use common::{assert_predecessors, assert_successors, build_ssa_from_source, get_
 #[test]
 fn test_empty_function_has_entry_block() {
     let source = r#"
-        contract Test[Active] {}
-        Test@Active(any) {
+        contract Test {
             entrypoint empty() {}
         }
     "#;
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     // Should have exactly 1 block (entry)
     assert_eq!(cfg.blocks.len(), 1, "Empty function should have exactly 1 block");
@@ -44,8 +43,7 @@ fn test_empty_function_has_entry_block() {
 #[test]
 fn test_entry_block_is_set_correctly() {
     let source = r#"
-        contract Test[Active] {}
-        Test@Active(any) {
+        contract Test {
             entrypoint foo() {
                 var x: int = 5;
             }
@@ -54,7 +52,7 @@ fn test_entry_block_is_set_correctly() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     // Entry should point to a valid block
     assert!(
@@ -77,8 +75,7 @@ fn test_entry_block_is_set_correctly() {
 #[test]
 fn test_single_statement_single_block() {
     let source = r#"
-        contract Test[Active] {}
-        Test@Active(any) {
+        contract Test {
             entrypoint foo() {
                 var x: int = 42;
             }
@@ -87,7 +84,7 @@ fn test_single_statement_single_block() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     // Should have exactly 1 block
     assert_eq!(cfg.blocks.len(), 1, "Single statement should generate 1 block");
@@ -116,8 +113,7 @@ fn test_single_statement_single_block() {
 #[test]
 fn test_sequential_statements_same_block() {
     let source = r#"
-        contract Test[Active] {}
-        Test@Active(any) {
+        contract Test {
             entrypoint foo() {
                 var x: int = 1;
                 var y: int = 2;
@@ -128,7 +124,7 @@ fn test_sequential_statements_same_block() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     // Should have exactly 1 block for sequential statements
     assert_eq!(
@@ -164,8 +160,7 @@ fn test_sequential_statements_same_block() {
 #[test]
 fn test_return_statement_terminates_block() {
     let source = r#"
-        contract Test[Active] {}
-        Test@Active(any) {
+        contract Test {
             entrypoint get_value() -> int {
                 return 42;
             }
@@ -174,7 +169,7 @@ fn test_return_statement_terminates_block() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     let entry_block = &cfg.blocks[&cfg.entry];
 
@@ -204,8 +199,7 @@ fn test_return_statement_terminates_block() {
 #[test]
 fn test_function_parameters_registered() {
     let source = r#"
-        contract Test[Active] {}
-        Test@Active(any) {
+        contract Test {
             entrypoint add(a: int, b: int) -> int {
                 return a + b;
             }
@@ -214,7 +208,7 @@ fn test_function_parameters_registered() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     // Should have 2 parameters registered
     assert_eq!(
@@ -243,11 +237,11 @@ fn test_function_parameters_registered() {
             // Both operands should be registers (parameters)
             use merak_ir::ssa_ir::Operand;
             assert!(
-                matches!(left, Operand::Register(_)),
+                matches!(left, Operand::Location(_)),
                 "Left operand should be a register"
             );
             assert!(
-                matches!(right, Operand::Register(_)),
+                matches!(right, Operand::Location(_)),
                 "Right operand should be a register"
             );
         }
@@ -258,8 +252,7 @@ fn test_function_parameters_registered() {
 #[test]
 fn test_block_connectivity_simple_sequence() {
     let source = r#"
-        contract Test[Active] {}
-        Test@Active(any) {
+        contract Test {
             entrypoint foo() {
                 var x: int = 1;
             }
@@ -268,7 +261,7 @@ fn test_block_connectivity_simple_sequence() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     let entry_block = &cfg.blocks[&cfg.entry];
 
@@ -292,8 +285,7 @@ fn test_block_connectivity_simple_sequence() {
 #[test]
 fn test_multiple_basic_blocks_are_distinct() {
     let source = r#"
-        contract Test[Active] {}
-        Test@Active(any) {
+        contract Test {
             entrypoint foo(cond: bool) {
                 if (cond) {
                     var x: int = 1;
@@ -304,7 +296,7 @@ fn test_multiple_basic_blocks_are_distinct() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     // Should have multiple blocks (if creates at least 3: entry with Branch, then, else/exit)
     // NOTE: if statements no longer create a separate header block - condition is evaluated

@@ -81,22 +81,6 @@ impl<'ctx> SmtSolver<'ctx> {
         }
     }
 
-    /// Create a new SMT solver with custom timeout
-    /// Timeout is in milliseconds.
-    pub fn with_timeout(context: &'ctx Context, timeout_ms: u32) -> Self {
-        let solver = Solver::new(context);
-        let mut params = z3::Params::new(context);
-        params.set_u32("timeout", timeout_ms);
-        solver.set_params(&params);
-
-        Self {
-            context,
-            solver,
-            timeout_ms,
-            query_cache: HashMap::new(),
-        }
-    }
-
     /// Check if an implication is valid: assumptions ∧ antecedent ⇒ consequent
     ///
     /// Returns true if the implication holds for all interpretations.
@@ -107,7 +91,6 @@ impl<'ctx> SmtSolver<'ctx> {
         antecedent: &Predicate,
         consequent: &Predicate,
     ) -> Result<bool, SmtError> {
-        // Check cache
         let cache_key = format!("{:?} ∧ {:?} ⇒ {:?}", assumptions, antecedent, consequent);
         if let Some(cached) = self.query_cache.get(&cache_key) {
             return Ok(*cached == SmtResult::Unsatisfiable);
@@ -133,7 +116,6 @@ impl<'ctx> SmtSolver<'ctx> {
         let z3_consequent = self.predicate_to_z3(consequent, &mut var_context)?;
         self.solver.assert(&z3_consequent.not());
 
-        println!("Z3 antecedent: {:?}, consequent: {:?}", z3_antecedent, z3_consequent);
 
         // Check satisfiability
         let result = match self.solver.check() {
@@ -146,18 +128,6 @@ impl<'ctx> SmtSolver<'ctx> {
         self.query_cache.insert(cache_key, result);
 
         Ok(result == SmtResult::Unsatisfiable)
-    }
-
-    /// Check if a predicate is satisfiable
-    pub fn is_satisfiable(&mut self, predicate: &Predicate) -> Result<bool, SmtError> {
-        let mut var_context = HashMap::new();
-
-        self.solver.reset();
-        let z3_pred = self.predicate_to_z3(predicate, &mut var_context)?;
-        self.solver.assert(&z3_pred);
-
-        let result = self.solver.check();
-        Ok(matches!(result, SatResult::Sat))
     }
 
     /// Convert a Merak predicate to a Z3 boolean expression
@@ -248,6 +218,8 @@ impl<'ctx> SmtSolver<'ctx> {
                 let hex_value = i64::from_str_radix(&addr[2..], 16).unwrap_or(0);
                 Ok(Int::from_i64(self.context, hex_value))
             }
+            // TODO: Consider using a Z3Expr enum that can be either Int or Bool for better type safety
+            RefinementExpr::BoolLit(b, ..) => Ok(Int::from_i64(self.context, if *b { 1 } else { 0 })),
             RefinementExpr::BinOp { op, lhs, rhs, .. } => {
                 let lhs_z3 = self.expr_to_z3(lhs, var_context)?;
                 let rhs_z3 = self.expr_to_z3(rhs, var_context)?;
@@ -298,7 +270,8 @@ impl<'ctx> SmtSolver<'ctx> {
             }
 
             RefinementExpr::IntLit(n, ..) => Ok(Int::from_i64(self.context, *n)),
-
+            // TODO: Consider using a Z3Expr enum that can be either Int or Bool for better type safety
+            RefinementExpr::BoolLit(b, ..) => Ok(Int::from_i64(self.context, if *b { 1 } else { 0 })),
             RefinementExpr::AddressLit(addr, ..) => {
                 let hex_value = i64::from_str_radix(&addr[2..], 16).unwrap_or(0);
                 Ok(Int::from_i64(self.context, hex_value))

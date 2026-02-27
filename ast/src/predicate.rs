@@ -1,4 +1,4 @@
-use std::{collections::HashMap, fmt};
+use std::{collections::{HashMap, HashSet}, fmt};
 
 use crate::meta::SourceRef;
 use crate::node_id::NodeId;
@@ -42,6 +42,7 @@ pub enum RefinementExpr {
     Var(String, NodeId, SourceRef),
     IntLit(i64, NodeId, SourceRef),
     AddressLit(String, NodeId, SourceRef),
+    BoolLit(bool, NodeId, SourceRef),
 
     MsgSender(NodeId, SourceRef),
     MsgValue(NodeId, SourceRef),
@@ -129,10 +130,10 @@ impl Predicate {
             Predicate::Or(left, right, _, _) => left.contains_old() || right.contains_old(),
             Predicate::Not(pred, _, _) => pred.contains_old(),
             Predicate::UninterpFnCall {
-                name,
+                name: _,
                 args,
-                id,
-                source_ref,
+                id: _,
+                source_ref: _,
             } => args.iter().any(|arg| arg.contains_old()),
             Predicate::Implies(left, right, _, _) => left.contains_old() || right.contains_old(),
         }
@@ -144,12 +145,12 @@ impl Predicate {
             Predicate::False(id, sr) => Predicate::True(*id, sr.clone()),
 
             // Boolean variable: simply negate with Not
-            Predicate::Var(name, id, sr) => Predicate::Not(Box::new(self.clone()), *id, sr.clone()),
+            Predicate::Var(_, id, sr) => Predicate::Not(Box::new(self.clone()), *id, sr.clone()),
 
             // Uninterpreted function: negate with Not
             Predicate::UninterpFnCall {
-                name,
-                args,
+                name: _,
+                args: _,
                 id,
                 source_ref,
             } => Predicate::Not(Box::new(self.clone()), *id, source_ref.clone()),
@@ -259,6 +260,94 @@ impl Predicate {
             ),
         }
     }
+
+    pub fn free_variables(&self) -> HashSet<String> {
+        match self {
+            Predicate::True(_, _) | Predicate::False(_, _) => HashSet::new(),
+            Predicate::Var(name, _, _) => {
+                let mut vars = HashSet::new();
+                vars.insert(name.clone());
+                vars
+            }
+            Predicate::BinRel { lhs, rhs, .. } => {
+                let mut vars = lhs.free_variables();
+                vars.extend(rhs.free_variables());
+                vars
+            }
+            Predicate::And(l, r, _, _)
+            | Predicate::Or(l, r, _, _)
+            | Predicate::Implies(l, r, _, _) => {
+                let mut vars = l.free_variables();
+                vars.extend(r.free_variables());
+                vars
+            }
+            Predicate::Not(p, _, _) => p.free_variables(),
+            Predicate::UninterpFnCall { args, .. } => {
+                let mut vars = HashSet::new();
+                for arg in args {
+                    vars.extend(arg.free_variables());
+                }
+                vars
+            }
+        }
+    }
+
+    /// Substitute variables with expressions (for constant argument substitution)
+    pub fn substitute_exprs(&self, mapping: &HashMap<String, RefinementExpr>) -> Predicate {
+        match self {
+            Predicate::True(_, _) | Predicate::False(_, _) => self.clone(),
+            Predicate::Var(name, node_id, source_ref) => {
+                // A boolean variable used as predicate: check if it maps to an expression
+                if let Some(expr) = mapping.get(name) {
+                    // Convert the expression to a predicate context
+                    // If it's a boolean literal, return True/False
+                    match expr {
+                        RefinementExpr::BoolLit(true, _, _) => Predicate::True(*node_id, source_ref.clone()),
+                        RefinementExpr::BoolLit(false, _, _) => Predicate::False(*node_id, source_ref.clone()),
+                        _ => Predicate::Var(name.clone(), *node_id, source_ref.clone()),
+                    }
+                } else {
+                    self.clone()
+                }
+            }
+            Predicate::UninterpFnCall { name, args, id, source_ref } => Predicate::UninterpFnCall {
+                name: name.clone(),
+                args: args.iter().map(|arg| arg.substitute_exprs(mapping)).collect(),
+                id: *id,
+                source_ref: source_ref.clone(),
+            },
+            Predicate::BinRel { op, lhs, rhs, id, source_ref } => Predicate::BinRel {
+                op: *op,
+                lhs: lhs.substitute_exprs(mapping),
+                rhs: rhs.substitute_exprs(mapping),
+                id: *id,
+                source_ref: source_ref.clone(),
+            },
+            Predicate::And(left, right, node_id, source_ref) => Predicate::And(
+                Box::new(left.substitute_exprs(mapping)),
+                Box::new(right.substitute_exprs(mapping)),
+                *node_id,
+                source_ref.clone(),
+            ),
+            Predicate::Or(left, right, node_id, source_ref) => Predicate::Or(
+                Box::new(left.substitute_exprs(mapping)),
+                Box::new(right.substitute_exprs(mapping)),
+                *node_id,
+                source_ref.clone(),
+            ),
+            Predicate::Not(pred, node_id, source_ref) => Predicate::Not(
+                Box::new(pred.substitute_exprs(mapping)),
+                *node_id,
+                source_ref.clone(),
+            ),
+            Predicate::Implies(left, right, node_id, source_ref) => Predicate::Implies(
+                Box::new(left.substitute_exprs(mapping)),
+                Box::new(right.substitute_exprs(mapping)),
+                *node_id,
+                source_ref.clone(),
+            ),
+        }
+    }
 }
 
 impl fmt::Display for Predicate {
@@ -306,6 +395,7 @@ impl RefinementExpr {
             RefinementExpr::Var(_, id, _) => *id,
             RefinementExpr::IntLit(_, id, _) => *id,
             RefinementExpr::AddressLit(_, id, _) => *id,
+            RefinementExpr::BoolLit(_, id, _) => *id,
             RefinementExpr::MsgSender(id, _) => *id,
             RefinementExpr::MsgValue(id, _) => *id,
             RefinementExpr::BlockTimestamp(id, _) => *id,
@@ -322,6 +412,7 @@ impl RefinementExpr {
             RefinementExpr::Var(_, _, sr) => sr,
             RefinementExpr::IntLit(_, _, sr) => sr,
             RefinementExpr::AddressLit(_, _, sr) => sr,
+            RefinementExpr::BoolLit(_, _, sr) => sr,
             RefinementExpr::MsgSender(_, sr) => sr,
             RefinementExpr::MsgValue(_, sr) => sr,
             RefinementExpr::BlockTimestamp(_, sr) => sr,
@@ -337,6 +428,7 @@ impl RefinementExpr {
             RefinementExpr::Var(_, _, _)
             | RefinementExpr::IntLit(_, _, _)
             | RefinementExpr::AddressLit(_, _, _)
+            | RefinementExpr::BoolLit(_, _, _)
             | RefinementExpr::MsgValue(_, _)
             | RefinementExpr::BlockTimestamp(_, _)
             | RefinementExpr::MsgSender(_, _) => false,
@@ -349,6 +441,14 @@ impl RefinementExpr {
 
     pub fn substitute_vars(&self, stacks: &HashMap<String, String>) -> RefinementExpr {
         match self {
+            RefinementExpr::IntLit(_, _, _)
+            | RefinementExpr::AddressLit(_, _, _)
+            | RefinementExpr::BoolLit(_, _, _)
+            | RefinementExpr::MsgSender(_, _)
+            | RefinementExpr::MsgValue(_, _)
+            | RefinementExpr::BlockTimestamp(_, _) => {
+                self.clone()
+            }
             RefinementExpr::Var(var, node_id, source_ref) => {
                 if let Some(new_var) = stacks.get(var) {
                     RefinementExpr::Var(new_var.clone(), *node_id, source_ref.clone())
@@ -356,21 +456,6 @@ impl RefinementExpr {
                     // Keep the original variable if not in mapping
                     RefinementExpr::Var(var.clone(), *node_id, source_ref.clone())
                 }
-            }
-            RefinementExpr::IntLit(value, node_id, source_ref) => {
-                RefinementExpr::IntLit(*value, *node_id, source_ref.clone())
-            }
-            RefinementExpr::AddressLit(value, node_id, source_ref) => {
-                RefinementExpr::AddressLit(value.clone(), *node_id, source_ref.clone())
-            }
-            RefinementExpr::MsgSender(node_id, source_ref) => {
-                RefinementExpr::MsgSender(*node_id, source_ref.clone())
-            }
-            RefinementExpr::MsgValue(node_id, source_ref) => {
-                RefinementExpr::MsgValue(*node_id, source_ref.clone())
-            }
-            RefinementExpr::BlockTimestamp(node_id, source_ref) => {
-                RefinementExpr::BlockTimestamp(*node_id, source_ref.clone())
             }
             RefinementExpr::BinOp { op, lhs, rhs, id, source_ref } => RefinementExpr::BinOp {
                 op: *op,
@@ -398,6 +483,81 @@ impl RefinementExpr {
             },
         }
     }
+
+    /// Substitute variables with expressions (for constant argument substitution)
+    pub fn substitute_exprs(&self, mapping: &HashMap<String, RefinementExpr>) -> RefinementExpr {
+        match self {
+            RefinementExpr::IntLit(_, _, _)
+            | RefinementExpr::AddressLit(_, _, _)
+            | RefinementExpr::BoolLit(_, _, _)
+            | RefinementExpr::MsgSender(_, _)
+            | RefinementExpr::MsgValue(_, _)
+            | RefinementExpr::BlockTimestamp(_, _) => {
+                self.clone()
+            }
+            RefinementExpr::Var(var, _, _) => {
+                if let Some(replacement) = mapping.get(var) {
+                    replacement.clone()
+                } else {
+                    self.clone()
+                }
+            }
+            RefinementExpr::BinOp { op, lhs, rhs, id, source_ref } => RefinementExpr::BinOp {
+                op: *op,
+                lhs: Box::new(lhs.substitute_exprs(mapping)),
+                rhs: Box::new(rhs.substitute_exprs(mapping)),
+                id: *id,
+                source_ref: source_ref.clone(),
+            },
+            RefinementExpr::UnaryOp { op, expr, id, source_ref } => RefinementExpr::UnaryOp {
+                op: *op,
+                expr: Box::new(expr.substitute_exprs(mapping)),
+                id: *id,
+                source_ref: source_ref.clone(),
+            },
+            RefinementExpr::UninterpFn { name, args, id, source_ref } => RefinementExpr::UninterpFn {
+                name: name.clone(),
+                args: args.iter().map(|arg| arg.substitute_exprs(mapping)).collect(),
+                id: *id,
+                source_ref: source_ref.clone(),
+            },
+            RefinementExpr::Old { expr, id, source_ref } => RefinementExpr::Old {
+                expr: Box::new(expr.substitute_exprs(mapping)),
+                id: *id,
+                source_ref: source_ref.clone(),
+            },
+        }
+    }
+
+    pub fn free_variables(&self) -> HashSet<String> {
+        match self {
+            RefinementExpr::Var(name, _, _) => {
+                let mut vars = HashSet::new();
+                vars.insert(name.clone());
+                vars
+            }
+            RefinementExpr::IntLit(_, _, _)
+            | RefinementExpr::AddressLit(_, _, _)
+            | RefinementExpr::BoolLit(_, _, _)
+            | RefinementExpr::MsgSender(_, _)
+            | RefinementExpr::MsgValue(_, _)
+            | RefinementExpr::BlockTimestamp(_, _) => HashSet::new(),
+            RefinementExpr::BinOp { lhs, rhs, .. } => {
+                let mut vars = lhs.free_variables();
+                vars.extend(rhs.free_variables());
+                vars
+            }
+            RefinementExpr::UnaryOp { expr, .. } => expr.free_variables(),
+            RefinementExpr::UninterpFn { args, .. } => {
+                let mut vars = HashSet::new();
+                for arg in args {
+                    vars.extend(arg.free_variables());
+                }
+                vars
+            }
+            RefinementExpr::Old { expr, .. } => expr.free_variables(),
+        }
+    }
 }
 
 impl fmt::Display for RefinementExpr {
@@ -406,6 +566,7 @@ impl fmt::Display for RefinementExpr {
             RefinementExpr::Var(name, _, _) => write!(f, "{}", name),
             RefinementExpr::IntLit(val, _, _) => write!(f, "{}", val),
             RefinementExpr::AddressLit(addr, _, _) => write!(f, "{}", addr),
+            RefinementExpr::BoolLit(val, _, _) => write!(f, "{}", val),
             RefinementExpr::MsgSender(_, _) => write!(f, "msg.sender"),
             RefinementExpr::MsgValue(_, _) => write!(f, "msg.value"),
             RefinementExpr::BlockTimestamp(_, _) => write!(f, "block.timestamp"),

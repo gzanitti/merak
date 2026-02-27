@@ -1,0 +1,24 @@
+// Simple counter contract demonstrating basic state variables and functions
+// This example shows the fundamental building blocks of a Merak contract
+
+contract SimpleCounter {
+    state var count: {count: int | count >= 0} = 0;
+
+    constructor() {
+        count = 0;
+    }
+
+    entrypoint increment() {
+        count = count + 1;
+    }
+
+    entrypoint decrement() {
+        if (count > 0) {
+            count = count - 1;
+        }
+    }
+
+    external function getCount() -> {v: int | v >= 0} {
+        return count;
+    }
+}

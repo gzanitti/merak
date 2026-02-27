@@ -1,10 +1,10 @@
 use merak_ast::contract::{File, Program};
-use merak_ast::expression::{Expression, Literal};
+use merak_ast::expression::{Expression};
 use merak_ast::function::{Function, Modifier, Visibility};
 use merak_ast::statement::{Block, Statement};
 use merak_ast::types::Type;
 use merak_errors::MerakError;
-use merak_ir::ssa_ir::{SsaCfg, SsaContract};
+use merak_ir::ssa_ir::SsaContract;
 use merak_symbols::{QualifiedName, SymbolId, SymbolKind, SymbolNamespace, SymbolTable};
 
 pub mod refinements;
@@ -12,7 +12,6 @@ pub mod storage;
 mod typechecker;
 use typechecker::Typechecker;
 
-use crate::storage::analyze_storage;
 
 pub fn analyze(program: &Program) -> Result<SymbolTable, MerakError> {
     let mut errors = Vec::new();
@@ -54,12 +53,11 @@ pub fn analyze(program: &Program) -> Result<SymbolTable, MerakError> {
 }
 
 pub fn analyze_ssa(
-    contract: SsaContract,
-    cfg: &mut SsaCfg,
-    symbol_table: &mut SymbolTable,
+    contract: &mut SsaContract,
+    symbol_table: &SymbolTable,
 ) -> Result<(), MerakError> {
-    let storage_results = analyze_storage(&contract, cfg, symbol_table)?;
-    //analyze_refinements(&cfg, symbol_table)
+    storage::analyze_storage_contract(contract, symbol_table)?;
+    // TODO: refinements::analyze_refinements(contract, symbol_table)?;
     Ok(())
 }
 
@@ -245,7 +243,7 @@ fn collect_and_resolve_interfaces(
                 None)
                 .unwrap_or_else(|e| {
                     errors.push(e);
-                    SymbolId::new(0) // default value in case of error
+                    SymbolId::new("".to_string(), 0) // default value in case of error
                 });
 
             interface_fn_symbols.push(symbol_fn);
@@ -318,14 +316,21 @@ fn collect_and_resolve_function(
         };
 
 
-        let _ = symbol_table
+        let func_symbol_id = symbol_table
             .add_symbol(
                 function.id(),
                 func_qname.clone(),
                 kind,
                 function.return_type.clone(),
-            )
-            .map_err(|e| errors.push(e));
+            );
+
+        let func_symbol_id = match func_symbol_id {
+            Ok(id) => Some(id),
+            Err(e) => {
+                errors.push(e);
+                None
+            }
+        };
 
         // Push scope for function
         symbol_table.push_scope();
@@ -359,6 +364,26 @@ fn collect_and_resolve_function(
             symbol_table,
             errors,
         );
+
+        // Normalize return type binder: after processing the body,
+        // all params and local vars are in scope, so we can determine
+        // which variables in the return type constraint are the binder.
+        if let (Some(ref func_sid), Some(ref return_type)) = (&func_symbol_id, &function.return_type) {
+            match normalize_return_type_binder(return_type, symbol_table) {
+                Ok(normalized) => {
+                    let sym = symbol_table.get_symbol_mut(func_sid.clone());
+                    match &mut sym.kind {
+                        SymbolKind::Function { return_type, .. }
+                        | SymbolKind::Entrypoint { return_type, .. } => {
+                            *return_type = normalized.clone();
+                        }
+                        _ => {}
+                    }
+                    sym.ty = Some(normalized);
+                }
+                Err(e) => errors.push(e),
+            }
+        }
 
         // Pop function scope
         symbol_table.pop_scope();
@@ -437,6 +462,51 @@ fn validate_modifiers(function: &Function) -> Result<Modifier, MerakError> {
             function.name, function.source_ref
         )))
     }
+}
+
+/// Normalizes the binder variable in a function return type refinement.
+///
+/// Handles two cases:
+/// 1. Explicit binder (`{v: int | v > 0}`): `v` is the binder, substitute `v` → `__self`.
+/// 2. Implicit binder (`{int | v > 0}`): binder is already `__self`, but the constraint
+///    uses `v`. We use the symbol table to find variables in the constraint that are
+///    NOT declared in any scope → that's the binder. Must be exactly 0 or 1.
+fn normalize_return_type_binder(
+    return_type: &Type,
+    symbol_table: &SymbolTable,
+) -> Result<Type, MerakError> {
+    let mut result = return_type.clone();
+
+    if result.binder != "__self" {
+        // Explicit binder: {v: int | v > 0} → substitute v → __self
+        let mut subst = std::collections::HashMap::new();
+        subst.insert(result.binder.clone(), "__self".to_string());
+        result.constraint = result.constraint.substitute_vars(&subst);
+        result.binder = "__self".to_string();
+    } else {
+        // Implicit binder: {int | v > 0} → find undeclared variables
+        let free_vars = result.constraint.free_variables();
+        let undeclared: Vec<String> = free_vars
+            .into_iter()
+            .filter(|var| var != "__self")
+            .filter(|var| symbol_table.lookup(var, SymbolNamespace::Value).is_none())
+            .collect();
+
+        if undeclared.len() == 1 {
+            let mut subst = std::collections::HashMap::new();
+            subst.insert(undeclared[0].clone(), "__self".to_string());
+            result.constraint = result.constraint.substitute_vars(&subst);
+        } else if undeclared.len() > 1 {
+            return Err(MerakError::SemanticError(format!(
+                "Ambiguous binder in return type refinement: variables {:?} are not declared in scope. \
+                 Expected exactly one binder variable. Use explicit binder syntax like {{v: int | v > 0}} at {}",
+                undeclared, return_type.source_ref
+            )));
+        }
+        // undeclared.len() == 0: no binder variable found, constraint uses only known variables
+    }
+
+    Ok(result)
 }
 
 fn collect_and_resolve_block(
@@ -625,14 +695,7 @@ fn resolve_names_in_expression(
         Expression::UnaryOp { expr: inner, .. } => {
             resolve_names_in_expression(inner, symbol_table, errors);
         }
-        Expression::Literal(lit, id, ..) => {
-            // match lit {
-            //     Literal::Integer(_) => todo!(),
-            //     Literal::Address(_) => todo!(),
-            //     Literal::Boolean(_) => todo!(),
-            //     Literal::String(_) => todo!(),
-            // }
-        }
+        Expression::Literal(..) => {}
         Expression::Grouped(inner, ..) => {
             resolve_names_in_expression(inner, symbol_table, errors);
         }

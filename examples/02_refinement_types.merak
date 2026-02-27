@@ -1,0 +1,39 @@
+// Demonstrating refinement types and their usage
+// Refinement types allow specifying constraints on values
+
+contract RefinementDemo {
+    state var balance: {balance: int | balance >= 0} = 0;
+    state const maxDeposit: int = 100;
+
+    constructor() {
+        balance = 0;
+    }
+
+    // Parameter with refinement type ensures only positive amounts
+    entrypoint deposit(amount: {amount: int | amount > 0 && amount <= 100}) {
+        balance = balance + amount;
+    }
+
+    // Guard ensures balance doesn't go negative
+    entrypoint withdraw(amount: {amount: int | amount >= 0}) {
+        if (balance >= amount) {
+            balance = balance - amount;
+        }
+    }
+
+    // Return type with refinement
+    internal function doublePositive(x: {x: int | x > 0}) -> {v: int | v > x} {
+        var result = x + x;
+        return result;
+    }
+
+    // Demonstrating path-sensitive refinements
+    entrypoint conditionalUpdate(x: int) {
+        if (x > 0) {
+            var positive: {v: int | v > 0} = x;
+            balance = balance + positive;
+        } else {
+            var nonPositive: {v: int | v <= 0} = x;
+        }
+    }
+}

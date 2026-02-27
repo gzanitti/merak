@@ -1,0 +1,40 @@
+// Loop invariants and variants example
+// Demonstrating how to verify loop correctness with invariants
+
+contract LoopExamples {
+    state var total: {total: int | total >= 0} = 0;
+
+    constructor() {
+        total = 0;
+    }
+
+    // Simple countdown loop with invariant and variant
+    entrypoint countdown(n: {n: int | n >= 0}) {
+        var i = n;
+        while (i > 0) with @invariant(i >= 0) @variant(i) {
+            i = i - 1;
+        }
+    }
+
+    // Accumulation loop
+    entrypoint sumUpTo(n: {n: int | n >= 0}) {
+        var i = 0;
+        var sum = 0;
+        while (i < n) with @invariant(i >= 0 && sum >= 0) @variant(n - i) {
+            sum = sum + 1;
+            i = i + 1;
+        }
+        total = sum;
+    }
+
+    // Safe withdrawal loop with balance check
+    entrypoint withdrawIncrements(times: {times: int | times >= 0}) {
+        var i = 0;
+        while (i < times) with @invariant(i >= 0 && total >= 0) @variant(times - i) {
+            if (total >= 10) {
+                total = total - 10;
+            }
+            i = i + 1;
+        }
+    }
+}

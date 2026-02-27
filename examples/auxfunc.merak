@@ -1,14 +1,15 @@
-contract AuxFunc[Open] {
+contract AuxFunc {
     state var counter: int = 0;
 
     constructor() {
         counter = 0;
     }
-}
 
-AuxFunc@Open(any) {
-    // Expose a function inside the Open state to be imported and called
     external function func1(a: int, b: int) -> int {
         return a + counter;
+    }
+
+    entrypoint incrementCounter() {
+        counter = counter + 1;
     }
 }

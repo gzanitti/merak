@@ -5,7 +5,8 @@ members = [
     "ast", "errors",
     "ir", #"opt",
     "parser", "merak-cli",
-    "analyzer", "symbols"
+    "analyzer", "symbols",
+    "codegen"
     ]
 
 [workspace.package]
@@ -23,5 +24,9 @@ merak-errors = { path = "./errors" }
 #merak-opt = { path = "./opt" }
 merak-analyzer = { path = "./analyzer" }
 merak-symbols = { path = "./symbols" }
+merak-codegen = { path = "./codegen" }
 
 indexmap = "2.0"
+
+[profile.bench]
+debug = true

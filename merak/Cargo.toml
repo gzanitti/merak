@@ -10,4 +10,5 @@ merak-errors.workspace = true
 merak-ast.workspace = true
 merak-analyzer.workspace = true
 merak-ir.workspace = true
+merak-codegen.workspace = true
 indexmap.workspace = true

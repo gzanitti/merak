@@ -1,4 +1,5 @@
 use std::cell::Cell;
+use std::collections::HashMap;
 
 use indexmap::IndexMap;
 use merak_ast::{
@@ -12,13 +13,44 @@ use merak_errors::MerakError;
 use merak_symbols::{SymbolId, SymbolKind, SymbolTable};
 
 use crate::ssa_ir::{
-    BlockId, CallTarget, Constant, Operand, Register, SsaCfg, SsaContract, SsaFile, SsaInstruction, SsaProgram, Terminator
+    BlockId, CallTarget, Constant, Operand, Register, SsaCfg, SsaContract, SsaFile, SsaInstruction, SsaOperand, SsaProgram, Terminator, TerminatorMeta
 };
 
 pub struct SsaBuilder {
     symbol_table: SymbolTable,
     current_block: BlockId,
+    ssa_versions: SsaVersioner,
+}
+
+struct SsaVersioner {
+    symbol_to_version: HashMap<SymbolId, usize>,
     next_temp_id: Cell<usize>,
+}
+
+impl SsaVersioner {
+    fn new() -> Self {
+        Self {
+            symbol_to_version: HashMap::new(),
+            next_temp_id: Cell::new(0),
+        }
+    }
+
+    fn next_version(&mut self, symbol: SymbolId) -> usize {
+        println!("Symbol: {symbol}");
+        let version = self.symbol_to_version.entry(symbol).or_insert(0);
+        println!("Version {version}");
+        let current = *version;
+        println!("Version {version}, Current {current}");
+        *version += 1;
+        println!("Version {version}, Current {current}");
+        current
+    }
+
+    fn next_temp_id(&self) -> usize {
+        let next = self.next_temp_id.get();
+        self.next_temp_id.set(next + 1);
+        next
+    }
 }
 
 // TODO: For now we use a simple `SsaBuilder` to handle the transformation directly.
@@ -29,13 +61,12 @@ impl SsaBuilder {
         Self {
             symbol_table,
             current_block: 0,
-            next_temp_id: Cell::new(0),
+            ssa_versions: SsaVersioner::new(),
         }
     }
 
     fn new_temp_register(&self) -> Register {
-        let temp_id = self.next_temp_id.get();
-        self.next_temp_id.set(temp_id + 1);
+        let temp_id = self.ssa_versions.next_temp_id();
 
         Register {
             symbol: SymbolId::synthetic_temp(temp_id),
@@ -99,6 +130,21 @@ impl SsaBuilder {
             self.current_block = entry_block;
 
             self.transform_block(&constructor.body, &mut ssa_cfg)?;
+
+            // If the last block has no explicit return, add an implicit void return.
+            if matches!(
+                ssa_cfg.blocks.get(&self.current_block).unwrap().terminator,
+                Terminator::Unreachable
+            ) {
+                ssa_cfg.add_terminator_at(
+                    self.current_block,
+                    Terminator::Return {
+                        value: None,
+                        meta: TerminatorMeta::default(),
+                    },
+                );
+            }
+
             ssa_cfg.compute_dominance();
             ssa_cfg.build_loop_forest();
             ssa_cfg.insert_phi_nodes_and_rename();
@@ -121,22 +167,6 @@ impl SsaBuilder {
             functions,
         })
     }
-
-    // fn build_state_def(&mut self, state_def: &StateDef) -> Result<SsaStateDef, MerakError> {
-    //     let mut ssa_functions = vec![];
-    //     for function in &state_def.functions {
-    //         let ssa_function = self.build_function(function)?;
-    //         ssa_functions.push(ssa_function);
-    //     }
-
-    //     Ok(SsaStateDef {
-    //         contract: state_def.contract.clone(),
-    //         name: state_def.name.clone(),
-    //         owner: state_def.owner.clone(),
-    //         functions: ssa_functions,
-    //         source_ref: state_def.source_ref.clone(),
-    //     })
-    // }
 
     fn build_function(&mut self, function: &Function) -> Result<SsaCfg, MerakError> {
         let function_id = self
@@ -204,11 +234,6 @@ impl SsaBuilder {
                     (exit_bb, exit_bb)
                 };
 
-                // ssa_cfg
-                //     .add_terminator_at(self.current_block, Terminator::Jump { target: header_bb });
-                // ssa_cfg.add_edge(self.current_block, header_bb);
-                //self.current_block = header_bb;
-
                 let cond_operand = self
                     .transform_expression(condition, ssa_cfg)
                     .expect("condition in if statement cannot be void");
@@ -218,9 +243,11 @@ impl SsaBuilder {
                         condition: cond_operand,
                         then_block: then_bb,
                         else_block: else_bb,
-                        invariants: vec![], // empty for ifs, >= 1 for loops
-                        variants: vec![], // empty for ifs, >= 1 for loops
-                        source_ref: source_ref.clone(),
+                        meta: TerminatorMeta {
+                            source_ref: source_ref.clone(),
+                            loop_invariants: vec![], // empty for ifs, >= 1 for loops
+                            loop_variants: vec![],   // empty for ifs, >= 1 for loops
+                        },
                     },
                 );
 
@@ -234,7 +261,6 @@ impl SsaBuilder {
                 if matches!(ssa_cfg.blocks.get(&self.current_block).unwrap().terminator, Terminator::Unreachable) {
                     ssa_cfg.add_terminator_at(self.current_block, Terminator::Jump { target: exit_bb });
                 }
-                //ssa_cfg.add_terminator_at(then_bb, Terminator::Jump { target: exit_bb });
 
                 if let Some(else_block) = else_block {
                     self.current_block = else_bb;
@@ -277,9 +303,11 @@ impl SsaBuilder {
                         condition: cond_operand,
                         then_block: body_bb,
                         else_block: exit_bb,
-                        invariants: invariants.to_vec(),
-                        variants: variants.to_vec(),
-                        source_ref: source_ref.clone(),
+                        meta: TerminatorMeta {
+                            source_ref: source_ref.clone(),
+                            loop_invariants: invariants.to_vec(),
+                            loop_variants: variants.to_vec(),
+                        },
                     },
                 );
 
@@ -300,7 +328,11 @@ impl SsaBuilder {
 
                 let terminator = Terminator::Return {
                     value: return_value,
-                    source_ref: source_ref.clone(),
+                    meta: TerminatorMeta {
+                        source_ref: source_ref.clone(),
+                        loop_invariants: vec![],
+                        loop_variants: vec![],
+                    },
                 };
 
                 ssa_cfg.add_terminator_at(self.current_block, terminator);
@@ -311,10 +343,10 @@ impl SsaBuilder {
                 id,
                 source_ref,
             } => {
-                let symbol_info = self.symbol_table.get_symbol_by_node_id(*id).unwrap();
                 let value = self
                     .transform_expression(expr, ssa_cfg)
                     .expect("cannot assign void value");
+                let symbol_info = self.symbol_table.get_symbol_by_node_id(*id).unwrap();
                 let symbol = self.symbol_table.get_symbol_id_by_node_id(*id).unwrap();
                 match symbol_info.kind {
                     SymbolKind::StateVar | SymbolKind::StateConst => {
@@ -325,7 +357,8 @@ impl SsaBuilder {
                         });
                     }
                     SymbolKind::LocalVar | SymbolKind::Parameter => {
-                        let dest = Register { symbol, version: 0 };
+                        println!("Symbol local: {}", symbol.clone());
+                        let dest = Register { symbol: symbol.clone(), version: self.ssa_versions.next_version(symbol) };
 
                         ssa_cfg.add_instruction_at(self.current_block, SsaInstruction::Copy {
                             dest,
@@ -354,7 +387,8 @@ impl SsaBuilder {
                 let value = self
                     .transform_expression(expr, ssa_cfg)
                     .expect("variable initializer cannot be void");
-                let dest = Register { symbol, version: 0 };
+                println!("Symbol cons {}", symbol.clone());
+                let dest = Register { symbol: symbol.clone(), version: self.ssa_versions.next_version(symbol) };
 
                 ssa_cfg.add_instruction_at(self.current_block, SsaInstruction::Copy {
                     dest,
@@ -367,10 +401,10 @@ impl SsaBuilder {
     }
 
     fn transform_expression(
-        &self,
+        &mut self,
         expression: &Expression,
         ssa_cfg: &mut SsaCfg,
-    ) -> Option<Operand> {
+    ) -> Option<SsaOperand> {
         match expression {
             Expression::Literal(lit, _, _) => match lit {
                 Literal::Integer(i) => Some(Operand::Constant(Constant::Int(*i))),
@@ -387,19 +421,20 @@ impl SsaBuilder {
                 match symbol_info.kind {
                     SymbolKind::StateVar | SymbolKind::StateConst => {
                         let temp = self.new_temp_register();
-                        ssa_cfg.local_temps.insert(temp, symbol_info.ty.as_ref().expect("Deberia estar definido (Identifier State)").base.clone());
+                        ssa_cfg.local_temps.insert(temp.symbol.clone(), symbol_info.ty.as_ref().expect("Deberia estar definido (Identifier State)").base.clone());
                         ssa_cfg.add_instruction_at(
                             self.current_block,
                             SsaInstruction::StorageLoad {
-                                dest: temp,
+                                dest: temp.clone(),
                                 var: symbol,
                                 source_ref: source_ref.clone(),
                             },
                         );
-                        Some(Operand::Register(temp))
+                        Some(Operand::Location(temp))
                     }
                     SymbolKind::LocalVar | SymbolKind::Parameter => { // TODO: LocalVar v = 0?
-                        Some(Operand::Register(Register { symbol, version: 0 }))
+                        println!("LocalVar: {}", symbol.clone());
+                        Some(Operand::Location(Register { symbol: symbol.clone(), version: self.ssa_versions.next_version(symbol) }))
                     }
                     _ => unreachable!("Invalid kind in assigment: {:?}", symbol_info.kind),
                 }
@@ -420,7 +455,7 @@ impl SsaBuilder {
                 let target = self.new_temp_register();
 
                 let symbol_info = self.symbol_table.expr_to_type(*id).expect("Ya se cargo");
-                ssa_cfg.local_temps.insert(target, symbol_info.clone());
+                ssa_cfg.local_temps.insert(target.symbol.clone(), symbol_info.clone());
 
                 ssa_cfg.add_instruction_at(
                     self.current_block,
@@ -428,11 +463,11 @@ impl SsaBuilder {
                         left: left_operand,
                         right: right_operand,
                         op: op.clone(),
-                        dest: target,
+                        dest: target.clone(),
                         source_ref: source_ref.clone(),
                     },
                 );
-                Some(Operand::Register(target))
+                Some(Operand::Location(target))
             }
             Expression::UnaryOp {
                 op,
@@ -445,17 +480,17 @@ impl SsaBuilder {
                     .expect("unary operation operand cannot be void");
                 let target = self.new_temp_register();
                 let symbol_info = self.symbol_table.expr_to_type(*id).expect("Ya se cargo");
-                ssa_cfg.local_temps.insert(target, symbol_info.clone());
+                ssa_cfg.local_temps.insert(target.symbol.clone(), symbol_info.clone());
                 ssa_cfg.add_instruction_at(
                     self.current_block,
                     SsaInstruction::UnaryOp {
                         op: op.clone(),
                         operand,
-                        dest: target,
+                        dest: target.clone(),
                         source_ref: source_ref.clone(),
                     },
                 );
-                Some(Operand::Register(target))
+                Some(Operand::Location(target))
             }
             Expression::Grouped(expression, _, _) => self.transform_expression(expression, ssa_cfg),
             Expression::FunctionCall {
@@ -480,13 +515,13 @@ impl SsaBuilder {
                             None
                         } else {
                             let target = self.new_temp_register();
-                            ssa_cfg.local_temps.insert(target, return_type.base.clone());
+                            ssa_cfg.local_temps.insert(target.symbol.clone(), return_type.base.clone());
                             Some(target)
                         }
                     }
                     SymbolKind::Contract => {
                         let target = self.new_temp_register();
-                        ssa_cfg.local_temps.insert(target, BaseType::Contract(name.clone()));
+                        ssa_cfg.local_temps.insert(target.symbol.clone(), BaseType::Contract(name.clone()));
                         Some(target)
                     }
                     e => {
@@ -505,14 +540,14 @@ impl SsaBuilder {
                 ssa_cfg.add_instruction_at(
                     self.current_block,
                     SsaInstruction::Call {
-                        dest,
+                        dest: dest.clone(),
                         target: CallTarget::Internal(symbol_id),
                         args: args_operands,
                         source_ref: source_ref.clone(),
                     },
                 );
 
-                dest.map(Operand::Register)
+                dest.map(Operand::Location)
             }
             Expression::MemberCall { 
                 object, 
@@ -546,7 +581,7 @@ impl SsaBuilder {
                             None
                         } else {
                             let target = self.new_temp_register();
-                            ssa_cfg.local_temps.insert(target, return_type.base.clone());
+                            ssa_cfg.local_temps.insert(target.symbol.clone(), return_type.base.clone());
                             Some(target)
                         }
                     }
@@ -556,7 +591,7 @@ impl SsaBuilder {
                 ssa_cfg.add_instruction_at(
                     self.current_block,
                     SsaInstruction::Call {
-                        dest,
+                        dest: dest.clone(),
                         target: CallTarget::External {
                             object: object_operand,
                             method: method_symbol,
@@ -566,7 +601,7 @@ impl SsaBuilder {
                     },
                 );
                 
-                dest.map(Operand::Register)
+                dest.map(Operand::Location)
             }
         }
     }

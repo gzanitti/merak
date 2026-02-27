@@ -64,11 +64,10 @@ pub fn get_function_cfg<'a>(
         })
 }
 
-/// Helper for tests with a single function - returns the first function in a state
+/// Helper for tests with a single function - returns the first function
 pub fn get_single_function_cfg<'a>(
     program: &'a SsaProgram,
     contract_name: &str,
-    state_name: &str,
 ) -> &'a SsaCfg {
     let file = program
         .files
@@ -82,15 +81,15 @@ pub fn get_single_function_cfg<'a>(
 }
 
 /// Finds a block that matches a predicate
-pub fn find_block_with<F>(cfg: &SsaCfg, predicate: F) -> Option<&BasicBlock>
+pub fn find_block_with<F>(cfg: &SsaCfg, predicate: F) -> Option<&BasicBlock<SsaInstruction>>
 where
-    F: Fn(&BasicBlock) -> bool,
+    F: Fn(&BasicBlock<SsaInstruction>) -> bool,
 {
     cfg.blocks.values().find(|block| predicate(block))
 }
 
 /// Counts instructions of a specific type in a block
-pub fn count_instructions_of_type<F>(block: &BasicBlock, predicate: F) -> usize
+pub fn count_instructions_of_type<F>(block: &BasicBlock<SsaInstruction>, predicate: F) -> usize
 where
     F: Fn(&SsaInstruction) -> bool,
 {
@@ -98,7 +97,7 @@ where
 }
 
 /// Asserts that a block has exactly the expected number of predecessors
-pub fn assert_predecessors(block: &BasicBlock, expected: usize) {
+pub fn assert_predecessors(block: &BasicBlock<SsaInstruction>, expected: usize) {
     assert_eq!(
         block.predecessors.len(),
         expected,
@@ -111,7 +110,7 @@ pub fn assert_predecessors(block: &BasicBlock, expected: usize) {
 }
 
 /// Asserts that a block has exactly the expected number of successors
-pub fn assert_successors(block: &BasicBlock, expected: usize) {
+pub fn assert_successors(block: &BasicBlock<SsaInstruction>, expected: usize) {
     assert_eq!(
         block.successors.len(),
         expected,
@@ -124,7 +123,7 @@ pub fn assert_successors(block: &BasicBlock, expected: usize) {
 }
 
 /// Extracts all phi nodes from a block
-pub fn get_phi_nodes(block: &BasicBlock) -> Vec<&SsaInstruction> {
+pub fn get_phi_nodes(block: &BasicBlock<SsaInstruction>) -> Vec<&SsaInstruction> {
     block
         .instructions
         .iter()

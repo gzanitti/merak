@@ -2,7 +2,7 @@ use std::cell::RefCell;
 use std::iter::zip;
 
 use merak_ast::{
-    contract::{Contract, File},
+    contract::{Contract},
     expression::{BinaryOperator, Expression, Literal},
     meta::{SourceRef, SourceRefGuard},
     node_id::NodeId,
@@ -93,6 +93,7 @@ impl Typechecker {
                 source_ref,
             } => {
                 let _guard = SourceRefGuard::new(source_ref.clone());
+                self.check_condition(condition)?;
                 let inferred_type = self.infer_basetype(condition)?;
                 self.check_basetype(&inferred_type, &BaseType::Bool)?;
 
@@ -111,6 +112,7 @@ impl Typechecker {
             } => {
                 let _guard = SourceRefGuard::new(source_ref.clone());
                 eprintln!("Variants and variants are not typechecked yet");
+                self.check_condition(condition)?;
                 let inferred_type = self.infer_basetype(condition)?;
                 self.check_basetype(&inferred_type, &BaseType::Bool)?;
                 self.check_block(body)?;
@@ -217,9 +219,37 @@ impl Typechecker {
         Ok(())
     }
 
-    // Requires `&mut self` because MemberCall resolution (`object.method()`) needs type information
-    // to construct the qualified name (`Contract::method`). This can only be done during type checking
-    // after inferring the object's type, not during name resolution phase.
+    fn check_condition(&mut self, expr: &Expression) -> Result<(), MerakError> {
+        if !self.is_pure_logical(expr) {
+            return Err(MerakError::SemanticError(
+                "Condition must be pure logical expression (no method calls, no side effects)".to_string()
+            ));
+        }
+        Ok(())
+    }
+
+    fn is_pure_logical(&self, expr: &Expression) -> bool {
+        match expr {
+            Expression::Literal(_, _, _) => true,
+            Expression::Identifier(_, _, _) => true,
+            Expression::BinaryOp { left, right, .. } => {
+                self.is_pure_logical(left) && self.is_pure_logical(right)
+            }
+            Expression::FunctionCall { name, args, .. } => {
+                Self::is_pure_function(name) && 
+                args.iter().all(|arg| self.is_pure_logical(arg))
+            }
+            Expression::MemberCall { .. } => false,
+            Expression::UnaryOp { expr, .. } |
+             Expression::Grouped(expr,..)=> self.is_pure_logical(expr),
+        }
+    }
+
+    fn is_pure_function(_name: &str) -> bool {
+        // TODO: Implement whitelist of pure functions
+        true
+    }
+
     fn infer_basetype(&mut self, expr: &Expression) -> Result<BaseType, MerakError> {
         match expr {
             Expression::Literal(literal, id, ..) => {
@@ -360,9 +390,7 @@ impl Typechecker {
                         source_ref: source_ref.clone(),
                     })?;
 
-                //println!("MemberCall id: {id:?}");
-                //println!("Method symbol id: {}", method_symbol_id);
-                let method_symbol = self.symbol_table.get_symbol(method_symbol_id);
+                let method_symbol = self.symbol_table.get_symbol(&method_symbol_id);
                 
                 let (return_type, parameters) = match &method_symbol.kind {
                     SymbolKind::InterfaceFunction { params, return_type, .. } => {

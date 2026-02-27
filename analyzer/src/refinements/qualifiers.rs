@@ -1,6 +1,7 @@
 use merak_ast::{
     meta::SourceRef,
     predicate::{ArithOp, Predicate, RefinementExpr, RelOp},
+    types::BaseType,
     NodeId,
 };
 use std::collections::HashSet;
@@ -165,8 +166,11 @@ impl Qualifier {
             } => {
                 let const_expr =
                     RefinementExpr::IntLit(*constant, SYNTHETIC_NODE_ID, source_ref.clone());
-                let nu_expr =
-                    RefinementExpr::Var("v".to_string(), SYNTHETIC_NODE_ID, source_ref.clone());
+                let nu_expr = RefinementExpr::Var(
+                    "__self".to_string(),
+                    SYNTHETIC_NODE_ID,
+                    source_ref.clone(),
+                );
 
                 if *lhs_is_nu {
                     Predicate::BinRel {
@@ -192,8 +196,11 @@ impl Qualifier {
                     RefinementExpr::Var(args[0].clone(), SYNTHETIC_NODE_ID, source_ref.clone());
                 let rhs_expr =
                     RefinementExpr::Var(args[1].clone(), SYNTHETIC_NODE_ID, source_ref.clone());
-                let nu_expr =
-                    RefinementExpr::Var("v".to_string(), SYNTHETIC_NODE_ID, source_ref.clone());
+                let nu_expr = RefinementExpr::Var(
+                    "__self".to_string(),
+                    SYNTHETIC_NODE_ID,
+                    source_ref.clone(),
+                );
 
                 let arith_expr = RefinementExpr::BinOp {
                     op: *op,
@@ -214,7 +221,7 @@ impl Qualifier {
 
             QualifierPattern::Boolean { negated } => {
                 let nu_pred =
-                    Predicate::Var("v".to_string(), SYNTHETIC_NODE_ID, source_ref.clone());
+                    Predicate::Var("__self".to_string(), SYNTHETIC_NODE_ID, source_ref.clone());
                 if *negated {
                     Predicate::Not(Box::new(nu_pred), SYNTHETIC_NODE_ID, source_ref)
                 } else {
@@ -237,8 +244,11 @@ impl Qualifier {
                     source_ref: source_ref.clone(),
                 };
 
-                let nu_expr =
-                    RefinementExpr::Var("v".to_string(), SYNTHETIC_NODE_ID, source_ref.clone());
+                let nu_expr = RefinementExpr::Var(
+                    "__self".to_string(),
+                    SYNTHETIC_NODE_ID,
+                    source_ref.clone(),
+                );
 
                 Predicate::BinRel {
                     op: result_op.unwrap_or(RelOp::Eq),
@@ -286,6 +296,11 @@ pub struct QualifierSet {
 impl QualifierSet {
     /// Create a qualifier set with core qualifiers only
     pub fn core() -> Self {
+        Self::with_constants(vec![])
+    }
+
+    /// Create a qualifier set with additional constants from program
+    pub fn with_constants(program_constants: Vec<i64>) -> Self {
         let mut qualifiers = Vec::new();
 
         // Comparisons: ? op v
@@ -301,10 +316,25 @@ impl QualifierSet {
             qualifiers.push(Qualifier::comparison(true, op));
         }
 
-        // Constants: 0 op v
-        for op in [RelOp::Leq, RelOp::Geq, RelOp::Lt, RelOp::Gt] {
-            qualifiers.push(Qualifier::constant_comparison(0, false, op));
-            qualifiers.push(Qualifier::constant_comparison(0, true, op));
+        // Constants: Base set + program constants
+        let mut all_constants: HashSet<i64> = HashSet::new();
+
+        // Base constants (common values)
+        for c in [0, 1] {
+            all_constants.insert(c);
+        }
+
+        // Add program constants
+        for c in program_constants {
+            all_constants.insert(c);
+        }
+
+        // Generate qualifier patterns for each constant
+        for constant in all_constants {
+            for op in [RelOp::Leq, RelOp::Geq, RelOp::Lt, RelOp::Gt, RelOp::Eq, RelOp::Neq] {
+                qualifiers.push(Qualifier::constant_comparison(constant, false, op));
+                qualifiers.push(Qualifier::constant_comparison(constant, true, op));
+            }
         }
 
         // Linear arithmetic: v = ? + ?, v >= ? + ?, etc.
@@ -358,49 +388,108 @@ impl QualifierSet {
     }
 
     /// Generate all instantiations of qualifiers with variables from context
-    pub fn instantiate_all(&self, context: &TypeContext) -> HashSet<Predicate> {
-        let mut instantiations = Vec::new();
-        let var_names: Vec<String> = context
+    /// Optimizations:
+    /// - Well-formedness pruning: only use variables in scope
+    /// - Type-based pruning: filter qualifiers that don't make sense for the type
+    /// - Ordering: simpler qualifiers first (by arity)
+    pub fn instantiate_all(&self, context: &TypeContext) -> Vec<Predicate> {
+        self.instantiate_all_with_relevance(context, &HashSet::new())
+    }
+
+    /// Generate instantiations with relevance information
+    /// Variables in `relevant_vars` will be prioritized in the ordering
+    pub fn instantiate_all_with_relevance(
+        &self,
+        context: &TypeContext,
+        relevant_vars: &HashSet<String>,
+    ) -> Vec<Predicate> {
+        //let mut instantiations: Vec<_> = Vec::new();
+
+        // Well-formedness: only variables that are actually in scope
+        // Also collect type information for type-based pruning
+        let var_info: Vec<(String, BaseType)> = context
             .bindings()
             .iter()
-            .map(|(name, _)| name.clone())
+            .map(|(name, template)| (name.clone(), template.base_type().clone()))
             .collect();
 
+        // Group qualifiers by arity for ordered processing
+        let mut by_arity: Vec<Vec<&Qualifier>> = vec![Vec::new(); 3];
         for qualifier in &self.qualifiers {
-            match qualifier.arity {
-                0 => {
-                    // No arguments needed
-                    if let Some(pred) = qualifier.instantiate(&[]) {
-                        instantiations.push(pred);
-                    }
-                }
-                1 => {
-                    // One argument: try each variable
-                    for var in &var_names {
-                        if let Some(pred) = qualifier.instantiate(&[var.clone()]) {
-                            instantiations.push(pred);
+            if qualifier.arity < 3 {
+                by_arity[qualifier.arity].push(qualifier);
+            }
+        }
+
+        // Separate into relevant and non-relevant candidates
+        // Relevant candidates mention variables from relevant_vars
+        let mut relevant_instantiations = Vec::new();
+        let mut other_instantiations = Vec::new();
+
+        // Process in order: arity 0, then 1, then 2
+        // This prioritizes simpler qualifiers
+        for arity in 0..3 {
+            for qualifier in &by_arity[arity] {
+                match qualifier.arity {
+                    0 => {
+                        // No arguments needed - always relevant (constants)
+                        if let Some(pred) = qualifier.instantiate(&[]) {
+                            relevant_instantiations.push(pred);
                         }
                     }
-                }
-                2 => {
-                    // Two arguments: try all pairs
-                    for v1 in &var_names {
-                        for v2 in &var_names {
-                            if let Some(pred) = qualifier.instantiate(&[v1.clone(), v2.clone()]) {
-                                instantiations.push(pred);
+                    1 => {
+                        // One argument: separate relevant from non-relevant
+                        for (var, var_type) in &var_info {
+                            // Type-based pruning: skip if qualifier doesn't make sense for this type
+                            if !Self::is_qualifier_compatible_with_type(*qualifier, var_type) {
+                                continue;
+                            }
+                            if let Some(pred) = qualifier.instantiate(&[var.clone()]) {
+                                // Relevance: prioritize qualifiers mentioning relevant variables
+                                if relevant_vars.contains(var) {
+                                    relevant_instantiations.push(pred);
+                                } else {
+                                    other_instantiations.push(pred);
+                                }
                             }
                         }
                     }
-                }
-                _ => {
-                    // Higher arity not supported yet
+                    2 => {
+                        // Two arguments: relevant if ANY variable is relevant
+                        for (v1, t1) in &var_info {
+                            for (v2, t2) in &var_info {
+                                // Type-based pruning: both variables should be compatible
+                                if !Self::is_binary_qualifier_compatible(
+                                    *qualifier, t1, t2
+                                ) {
+                                    continue;
+                                }
+                                if let Some(pred) = qualifier.instantiate(&[v1.clone(), v2.clone()]) {
+                                    // Relevance: relevant if either variable is relevant
+                                    if relevant_vars.contains(v1) || relevant_vars.contains(v2) {
+                                        relevant_instantiations.push(pred);
+                                    } else {
+                                        other_instantiations.push(pred);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        // Higher arity not supported yet
+                    }
                 }
             }
         }
 
-        // Remove duplicates
-        let unique: HashSet<_> = instantiations.into_iter().collect();
-        unique
+        // Return relevant candidates first, then others
+        relevant_instantiations.extend(other_instantiations);
+        relevant_instantiations
+    }
+
+    /// Generate instantiations but return as HashSet (for backwards compatibility)
+    pub fn instantiate_all_unique(&self, context: &TypeContext) -> HashSet<Predicate> {
+        self.instantiate_all(context).into_iter().collect()
     }
 
     /// Number of qualifiers in this set
@@ -411,5 +500,92 @@ impl QualifierSet {
     /// Is extended mode enabled?
     pub fn is_extended(&self) -> bool {
         self.extended
+    }
+
+    /// Check if a qualifier is compatible with a variable type (arity 1)
+    ///
+    /// Type-based pruning rules:
+    /// - Address: only equality/inequality, no numeric comparisons
+    /// - Bool: only boolean operations, no arithmetic
+    /// - Int: all operations allowed
+    /// - String: only equality/inequality
+    fn is_qualifier_compatible_with_type(qualifier: &Qualifier, var_type: &BaseType) -> bool {
+        match &qualifier.pattern {
+            QualifierPattern::Comparison { op, .. } => {
+                match var_type {
+                    BaseType::Address => {
+                        // Address: only equality checks make sense
+                        matches!(op, RelOp::Eq | RelOp::Neq)
+                    }
+                    BaseType::Bool => {
+                        // Bool: only equality checks
+                        matches!(op, RelOp::Eq | RelOp::Neq)
+                    }
+                    BaseType::String => {
+                        // String: only equality checks
+                        matches!(op, RelOp::Eq | RelOp::Neq)
+                    }
+                    BaseType::Int => true, // All comparisons valid for Int
+                    _ => false, // Tuples, Functions, Contracts: no comparisons
+                }
+            }
+            QualifierPattern::ConstantComparison { .. } => {
+                match var_type {
+                    BaseType::Address => {
+                        // Address comparisons with numeric constants don't make sense
+                        false
+                    }
+                    BaseType::Bool => {
+                        // Bool with numeric constants doesn't make sense
+                        false
+                    }
+                    BaseType::String => false,
+                    BaseType::Int => true, // All numeric comparisons valid
+                    _ => false,
+                }
+            }
+            QualifierPattern::BinaryArithmetic { .. } => {
+                // Arithmetic only makes sense for Int
+                matches!(var_type, BaseType::Int)
+            }
+            QualifierPattern::Boolean { .. } => {
+                // Boolean operations only for Bool
+                matches!(var_type, BaseType::Bool)
+            }
+            QualifierPattern::UninterpFunction { .. } => {
+                // Uninterpreted functions: allow for all types (domain-specific)
+                true
+            }
+            QualifierPattern::BlockchainGlobal { global, op } => {
+                match global {
+                    BlockchainGlobal::MsgSender => {
+                        // msg.sender is Address
+                        matches!(var_type, BaseType::Address) && matches!(op, RelOp::Eq | RelOp::Neq)
+                    }
+                    BlockchainGlobal::MsgValue | BlockchainGlobal::BlockTimestamp => {
+                        // msg.value and block.timestamp are Int
+                        matches!(var_type, BaseType::Int)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Check if a binary qualifier is compatible with two variable types (arity 2)
+    fn is_binary_qualifier_compatible(
+        qualifier: &Qualifier,
+        type1: &BaseType,
+        type2: &BaseType,
+    ) -> bool {
+        match &qualifier.pattern {
+            QualifierPattern::BinaryArithmetic { .. } => {
+                // Arithmetic requires both to be Int
+                matches!(type1, BaseType::Int) && matches!(type2, BaseType::Int)
+            }
+            _ => {
+                // Other patterns don't apply to arity 2
+                true
+            }
+        }
     }
 }

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 
 use merak_ast::{
@@ -121,11 +122,11 @@ pub enum Constraint {
     },
     
     /// Loop variant must decrease
-    /// Γ, V = v_old ⊢ V < v_old
+    /// Γ ⊢ V_after < V_before
     LoopVariantDecreases {
-        entry_context: TypeContext,
-        preservation_context: TypeContext,
-        variant: RefinementExpr,
+        context: TypeContext,
+        variant_before: RefinementExpr,
+        variant_after: RefinementExpr,
         location: SourceRef,
     },
 
@@ -186,7 +187,7 @@ impl Constraint {
             Constraint::LoopInvariantEntry { context, .. } => context,
             Constraint::LoopInvariantPreservation { context, .. } => context,
             Constraint::LoopVariantNonNegative { context, .. } => context,
-            Constraint::LoopVariantDecreases { entry_context, .. } => entry_context,
+            Constraint::LoopVariantDecreases { context, .. } => context,
             Constraint::Fold { context, .. } => context,
         }
     }
@@ -232,8 +233,8 @@ impl fmt::Display for Constraint {
             Constraint::LoopVariantNonNegative { variant, .. } => {
                 write!(f, "LOOP_INVARIANT_NON_NEGATIVE({variant})")
             }
-            Constraint::LoopVariantDecreases { variant, .. } => {
-                write!(f, "LOOP_INVARIANT_DECREASES({variant})")
+            Constraint::LoopVariantDecreases { variant_before, variant_after, .. } => {
+                write!(f, "LOOP_VARIANT_DECREASES({variant_after} < {variant_before})")
             }
             Constraint::Fold { var, refinement, .. } => {
                 write!(f, "FOLD({var}, {refinement})")
@@ -258,6 +259,11 @@ pub struct TypeContext {
     ///
     /// Example: inside `if (x > 0) { ... }`, we have (x > 0) in assumptions
     assumptions: Vec<Predicate>,
+
+    /// Source-level variable names to SSA register names
+    /// Allows the solver to resolve cross-variable references in refinements
+    /// (e.g., `{v: int | v > x}` where `x` is a source name but context has `x_0`)
+    source_to_ssa: HashMap<String, String>,
 }
 
 impl TypeContext {
@@ -266,6 +272,7 @@ impl TypeContext {
         Self {
             bindings: Vec::new(),
             assumptions: Vec::new(),
+            source_to_ssa: HashMap::new(),
         }
     }
 
@@ -298,19 +305,29 @@ impl TypeContext {
         &self.assumptions
     }
 
-    /// Create a copy of this context with an additional binding
-    pub fn with_binding(&self, name: String, template: Template) -> Self {
-        let mut new_ctx = self.clone();
-        new_ctx.bind(name, template);
-        new_ctx
+    /// Set the source-to-SSA name mapping for cross-variable reference resolution
+    pub fn set_source_to_ssa(&mut self, mapping: HashMap<String, String>) {
+        self.source_to_ssa = mapping;
     }
 
-    /// Create a copy of this context with an additional assumption
-    pub fn with_assumption(&self, predicate: Predicate) -> Self {
-        let mut new_ctx = self.clone();
-        new_ctx.assume(predicate);
-        new_ctx
+    /// Get the source-to-SSA name mapping
+    pub fn source_to_ssa(&self) -> &HashMap<String, String> {
+        &self.source_to_ssa
     }
+
+    // /// Create a copy of this context with an additional binding
+    // pub fn with_binding(&self, name: String, template: Template) -> Self {
+    //     let mut new_ctx = self.clone();
+    //     new_ctx.bind(name, template);
+    //     new_ctx
+    // }
+
+    // /// Create a copy of this context with an additional assumption
+    // pub fn with_assumption(&self, predicate: Predicate) -> Self {
+    //     let mut new_ctx = self.clone();
+    //     new_ctx.assume(predicate);
+    //     new_ctx
+    // }
 
     /// Check if a variable is in scope
     pub fn in_scope(&self, name: &str) -> bool {

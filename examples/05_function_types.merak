@@ -1,0 +1,46 @@
+// Demonstrating different function visibilities and modifiers
+// Functions can be: entrypoint, external, or internal
+
+contract FunctionTypes {
+    state var balance: int = 0;
+    state var locked: bool = false;
+
+    constructor() {
+        balance = 0;
+        locked = false;
+    }
+
+    // Entrypoint: public entry point that can modify state
+    entrypoint deposit() payable {
+        balance = balance + 100;
+    }
+
+    // External function: callable from outside, can be marked with modifiers
+    external function withdraw() guarded {
+        if (balance >= 50) {
+            balance = balance - 50;
+        }
+    }
+
+    // External function with reentrant modifier
+    external function callback() reentrant {
+        balance = balance + 10;
+    }
+
+    // Internal function: only callable from within the contract
+    internal function updateBalance(delta: int) {
+        balance = balance + delta;
+    }
+
+    // Entrypoint with multiple modifiers
+    entrypoint complexOperation() payable guarded {
+        balance = 0;
+        locked = false;
+    }
+
+    // Internal function with return value
+    internal function calculateFee(amount: int) -> int {
+        var fee = amount / 10;
+        return fee;
+    }
+}

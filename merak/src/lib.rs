@@ -3,12 +3,14 @@ use std::{collections::HashMap, path::PathBuf};
 use indexmap::IndexMap;
 use merak_analyzer::{analyze, analyze_ssa};
 use merak_ast::{NodeIdGenerator, contract::Program};
+use merak_codegen::Codegen;
 use merak_errors::MerakError;
 use merak_ir::transformers::ssa::SsaBuilder;
 use merak_parser::parse_file;
 
 // Re-export for external use
 pub use merak_ast;
+pub use merak_codegen::CompiledProgram;
 pub use merak_errors;
 
 #[derive(Debug)]
@@ -19,22 +21,35 @@ impl Compiler {
         Self
     }
 
-    pub fn compile(&mut self, entry: PathBuf) -> Result<(), MerakError> {
+    pub fn compile(&mut self, entry: PathBuf) -> Result<CompiledProgram, MerakError> {
         println!("Compiling {:?}", entry);
         let loaded = load_program(&entry)?;
 
-        // Phase 1-2: Symbol collection and type checking
+        // Phase 1-3: Symbol collection, type checking
         let symbol_table = analyze(&loaded)?;
 
-        // Phase 3-5: CFG, Dominance, SSA Transform
-        let ssa_program = SsaBuilder::new(symbol_table).build(&loaded)?;
+        // Phase 4-6: CFG construction, dominance analysis, SSA transform
+        let mut ssa_program = SsaBuilder::new(symbol_table.clone()).build(&loaded)?;
         println!("Finished generating SSA IR...");
 
-        // TODO: Phase 6-8: Storage Analysis, Refinement Inference, Type Checking on SSA
-        //analyze_ssa(ssa_program, symbol_table);
+        // Phase 7: Storage analysis (CEI pattern, immutability, fold/unfold insertion)
+        for (_, file) in &mut ssa_program.files {
+            analyze_ssa(&mut file.contract, &symbol_table)
+                .map_err(|e| MerakError::InternalError(format!("Storage analysis: {e}")))?;
+        }
+        println!("Finished storage analysis...");
 
-        // TODO: Phase 9+: ANF, VC Generation, SMT, Codegen
-        Ok(())
+        // Phase 8: Refinement checking (VC generation + SMT verification)
+        // TODO: not yet fully implemented
+        // merak_analyzer::refinements::check(&ssa_program, &symbol_table)?;
+
+        // Phase 9: Codegen — lower SSA to EVM bytecode
+        let compiled = Codegen::new()
+            .compile_program(&mut ssa_program, &symbol_table)
+            .map_err(|e| MerakError::InternalError(format!("Codegen: {:?}", e)))?;
+        println!("Finished generating EVM bytecode...");
+
+        Ok(compiled)
     }
 }
 

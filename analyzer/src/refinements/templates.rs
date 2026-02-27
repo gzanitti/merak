@@ -4,7 +4,6 @@ use merak_ast::{
     meta::SourceRef,
     predicate::Predicate,
     types::{BaseType, Type},
-    NodeId,
 };
 
 /// Liquid variable: represents an unknown refinement
@@ -42,14 +41,11 @@ impl LiquidVarGenerator {
 /// Key distinction:
 /// - **Liquid**: needs inference
 /// - **Concrete**: needs verification
-/// - **Unrefined**: no inference or verification
 #[derive(Debug, Clone)]
 pub enum Template {
     /// Template with liquid variable (unknown refinement to infer)
     ///
-    /// Example: `var x = 5;` or `var x: int = 5;`
-    /// Both cases arrive with Predicate::True from Phase 2
-    ///
+    /// Example: `var x = 5;` 
     /// Generated: {int | κ0} where κ0 will be resolved during solving
     Liquid {
         base: BaseType,
@@ -61,7 +57,6 @@ pub enum Template {
     /// Concrete template (known refinement to verify)
     ///
     /// Example: `var x: {int | x > 0} = 10;`
-    ///
     /// Generated: {int | x > 0} and verify that 10 satisfies x > 0
     Concrete {
         base: BaseType,
@@ -72,7 +67,6 @@ pub enum Template {
 }
 
 impl Template {
-        /// For symbol table lookups - assumes True means "infer", can't return unrefined templates
     pub fn from_type(ty: &Type, liquid_gen: &mut LiquidVarGenerator) -> Self {
         if ty.is_explicit_annotation() {
             Template::Concrete {
@@ -92,50 +86,35 @@ impl Template {
         }
     }
 
+    /// Substitute non-binder variables in the refinement predicate.
+    /// Used to resolve source-level names to SSA names in cross-variable
+    /// references (e.g., `{v: int | v > x}` where `x` needs to become `x_0`).
+    pub fn resolve_cross_refs(&mut self, source_to_ssa: &HashMap<String, String>) {
+        if let Template::Concrete { binder, refinement, .. } = self {
+            let mut filtered = source_to_ssa.clone();
+            filtered.remove(binder);
+            if !filtered.is_empty() {
+                *refinement = refinement.substitute_vars(&filtered);
+            }
+        }
+    }
+
     pub fn replace_binder(&mut self, new_binder: &str) {
         match self {
             Template::Concrete { binder, refinement, .. } => {
                 let mut subst = HashMap::new();
+                println!("BINDER NEW BINDER: {binder}, {new_binder}");
                 subst.insert(binder.clone(), new_binder.to_string());
 
                 *refinement = refinement.substitute_vars(&subst);
 
                 *binder = new_binder.to_string();
+                println!("REF {refinement}");
             },
             Template::Liquid { binder, .. } => {
                 *binder = new_binder.to_string();
             },
         };
-    }
-
-    /// Create liquid template directly (useful for intermediate expressions)
-    pub fn liquid(
-        base: BaseType,
-        binder: String,
-        liquid_var: LiquidVar,
-        source_ref: SourceRef,
-    ) -> Self {
-        Template::Liquid {
-            base,
-            binder,
-            liquid_var,
-            source_ref,
-        }
-    }
-
-    /// Create concrete template directly
-    pub fn concrete(
-        base: BaseType,
-        binder: String,
-        refinement: Predicate,
-        source_ref: SourceRef,
-    ) -> Self {
-        Template::Concrete {
-            base,
-            binder,
-            refinement,
-            source_ref,
-        }
     }
 
     /// Get the base type
@@ -239,9 +218,9 @@ impl fmt::Display for Template {
                 ..
             } => {
                 if binder == "ν" {
-                    write!(f, "{{{:?} | {}}}", base, liquid_var)
+                    write!(f, "{{{} | {}}}", base, liquid_var)
                 } else {
-                    write!(f, "{{{}: {:?} | {}}}", binder, base, liquid_var)
+                    write!(f, "{{{}: {} | {}}}", binder, base, liquid_var)
                 }
             }
             Template::Concrete {
@@ -251,9 +230,9 @@ impl fmt::Display for Template {
                 ..
             } => {
                 if binder == "ν" {
-                    write!(f, "{{{:?} | {:?}}}", base, refinement)
+                    write!(f, "{{{} | {}}}", base, refinement)
                 } else {
-                    write!(f, "{{{}: {:?} | {:?}}}", binder, base, refinement)
+                    write!(f, "{{{}: {} | {}}}", binder, base, refinement)
                 }
             }
         }

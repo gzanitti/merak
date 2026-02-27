@@ -103,14 +103,36 @@ impl<'ctx> ConstraintSolver<'ctx> {
     }
 
     /// Add constraints to solve
-    pub fn add_constraints(&mut self, constraints: ConstraintSet) {
-        self.constraints.extend(constraints.into_vec());
-    }
+    // pub fn add_constraints(&mut self, constraints: ConstraintSet) {
+    //     self.constraints.extend(constraints.into_vec());
+    // }
 
     /// Solve all constraints and return the liquid variable assignment
     pub fn solve(mut self) -> SolverResult<LiquidAssignment> {
+        println!("[SOLVER] Starting with {} constraints", self.constraints.len());
+
+        let mut subtype_count = 0;
+        let mut binary_op_count = 0;
+        let mut other_count = 0;
+        for c in self.constraints.iter() {
+            match c {
+                Constraint::Subtype { context, sub, sup, .. } => {
+                    println!("  - Subtype: {} <: {}", sub, sup);
+                    println!("  - Context (asumps): ");
+                    for ctx in context.assumptions() {
+                        println!("    - {} ", ctx);
+                    }
+                    subtype_count += 1;
+                }
+                Constraint::BinaryOp { .. } => binary_op_count += 1,
+                _ => other_count += 1,
+            }
+        }
+        println!("[SOLVER] Breakdown: {} Subtype, {} BinaryOp, {} Other", subtype_count, binary_op_count, other_count);
+
         // Step 1: Collect all liquid variables
         let liquid_vars = self.collect_liquid_vars();
+        println!("[SOLVER] Found {} liquid variables: {:?}", liquid_vars.len(), liquid_vars);
 
         // Step 2: Initialize assignment (start with True for all)
         for var in &liquid_vars {
@@ -121,6 +143,7 @@ impl<'ctx> ConstraintSolver<'ctx> {
         // Step 3: Iteratively refine assignment
         let max_iterations = 100;
         for iteration in 0..max_iterations {
+            println!("[SOLVER] Iteration {}", iteration);
             let mut changed = false;
 
             // Temporarily take constraints to allow &mut self in loop
@@ -130,17 +153,23 @@ impl<'ctx> ConstraintSolver<'ctx> {
 
             // Use indices instead of iter_mut to avoid borrow conflicts
             for i in 0..constraints_vec.len() {
-                if !self.check_constraint(&mut constraints_vec[i])? {
-                    // Constraint not satisfied, strengthen liquid variables
-                    match self.strengthen_for_constraint(&constraints_vec[i]) {
+                let check_result = self.check_constraint(&mut constraints_vec[i])?;
+                if !check_result {
+                    println!("[SOLVER] Constraint {} FAILED, attempting strengthening", i);
+                    // Constraint not satisfied, try to strengthen liquid variables
+                    match self.strengthen_for_constraint(&constraints_vec[i], constraints_vec) {
                         Ok(did_change) => {
                             changed |= did_change;
                         }
                         Err(e) => {
+                            // Hard constraint failed (loop invariants/variants)
+                            // These are fatal errors
                             self.constraints = constraints;
                             return Err(e);
                         }
                     }
+                } else {
+                    println!("[SOLVER] Constraint {} PASSED", i);
                 }
             }
 
@@ -149,6 +178,11 @@ impl<'ctx> ConstraintSolver<'ctx> {
 
             if !changed {
                 // Fixed point reached
+                println!("[SOLVER] Fixed point reached after {} iterations", iteration);
+                println!("[SOLVER] Final assignment:");
+                for (var, pred) in self.assignment.iter() {
+                    println!("  κ{} = {}", var.0, pred);
+                }
                 break;
             }
 
@@ -159,6 +193,34 @@ impl<'ctx> ConstraintSolver<'ctx> {
             }
         }
 
+        // Step 4: Final verification - check all constraints are satisfied
+        println!("[SOLVER] Final verification: checking all constraints");
+        let mut constraints = std::mem::take(&mut self.constraints);
+        let constraints_vec = constraints.constraints_mut();
+
+        for (i, constraint) in constraints_vec.iter_mut().enumerate() {
+            println!("[SOLVER] Final verification: checking constraint {}", i);
+            if !self.check_constraint(constraint)? {
+                // Failed constraint after fixed point - report error
+                let error_msg = match constraint {
+                    Constraint::Subtype { sub, sup, location, .. } => {
+                        format!(
+                            "Type error: cannot satisfy subtyping constraint\n\
+                            Expected: {}\n\
+                            Found: {}\n\
+                            Location: {:?}",
+                            sup, sub, location
+                        )
+                    }
+                    _ => format!("Constraint {} failed verification", i),
+                };
+                self.constraints = constraints;
+                return Err(SolverError::TypeMismatch { message: error_msg });
+            }
+        }
+
+        self.constraints = constraints;
+        println!("[SOLVER] All constraints verified successfully");
         Ok(self.assignment)
     }
 
@@ -226,11 +288,18 @@ impl<'ctx> ConstraintSolver<'ctx> {
         match constraint {
             Constraint::WellFormed {
                 context, template, ..
-            } => self.check_well_formed(context, template),
+            } => {
+                //println!("[DEBUG check_constraint] WellFormed: context={:?}, template={:?}", context, template);
+                self.check_well_formed(context, template)
+            }
 
             Constraint::Subtype {
                 context, sub: lhs, sup: rhs, ..
-            } => self.check_subtype(context, lhs, rhs),
+            } => {
+                println!("Subtype: {} <: {}", lhs, rhs);
+                //println!("[DEBUG check_constraint] Subtype: context={:?}, lhs={:?}, rhs={:?}", context, lhs, rhs);
+                self.check_subtype(context, lhs, rhs)
+            }
             Constraint::BinaryOp {
                 context,
                 op,
@@ -238,7 +307,11 @@ impl<'ctx> ConstraintSolver<'ctx> {
                 right,
                 result,
                 ..
-            } => self.check_binary_op(context, op, left, right, result),
+            } => {
+                println!("BinaryOp");
+                //println!("[DEBUG check_constraint] BinaryOp: context={:?}, op={:?}, left={:?}, right={:?}, result={:?}", context, op, left, right, result);
+                self.check_binary_op(context, op, left, right, result)
+            }
 
             Constraint::UnaryOp {
                 context,
@@ -246,44 +319,67 @@ impl<'ctx> ConstraintSolver<'ctx> {
                 operand,
                 result,
                 ..
-            } => self.check_unary_op(context, op, operand, result),
+            } => {
+                //println!("[DEBUG check_constraint] UnaryOp: context={:?}, op={:?}, operand={:?}, result={:?}", context, op, operand, result);
+                self.check_unary_op(context, op, operand, result)
+            }
             Constraint::Ensures {
                 context,
                 condition,
                 ..
-            } => self.check_ensures(context, condition),
-            Constraint::Requires { 
-                context, 
+            } => {
+                //println!("[DEBUG check_constraint] Ensures: context={:?}, condition={:?}", context, condition);
+                self.check_ensures(context, condition)
+            }
+            Constraint::Requires {
+                context,
                 condition,
-                .. 
-            } => self.check_requires(context, condition),
-            Constraint::LoopInvariantEntry { 
-                context, 
-                invariant, 
-                .. 
-            } => self.check_loop_invariant_entry(context, invariant),
-            Constraint::LoopInvariantPreservation { 
-                context, 
-                invariant, 
-                .. 
-            } => self.check_loop_invariant_preservation(context, invariant),
-            Constraint::LoopVariantDecreases { 
-                entry_context, 
-                preservation_context, 
-                variant, 
-                .. 
-            } => self.check_variant_decreases(entry_context, preservation_context, variant),
-            Constraint::LoopVariantNonNegative { 
-                context, 
-                variant, 
-                .. 
-            } => self.check_variant_non_negative(context, variant),
-            Constraint::Fold { 
+                ..
+            } => {
+                //println!("[DEBUG check_constraint] Requires: context={:?}, condition={:?}", context, condition);
+                self.check_requires(context, condition)
+            }
+            Constraint::LoopInvariantEntry {
+                context,
+                invariant,
+                ..
+            } => {
+                //println!("[DEBUG check_constraint] LoopInvariantEntry: context={:?}, invariant={:?}", context, invariant);
+                self.check_loop_invariant_entry(context, invariant)
+            }
+            Constraint::LoopInvariantPreservation {
+                context,
+                invariant,
+                ..
+            } => {
+                //println!("[DEBUG check_constraint] LoopInvariantPreservation: context={:?}, invariant={:?}", context, invariant);
+                self.check_loop_invariant_preservation(context, invariant)
+            }
+            Constraint::LoopVariantDecreases {
+                context,
+                variant_before,
+                variant_after,
+                ..
+            } => {
+                self.check_variant_decreases(context, variant_before, variant_after)
+            }
+            Constraint::LoopVariantNonNegative {
+                context,
+                variant,
+                ..
+            } => {
+                //println!("[DEBUG check_constraint] LoopVariantNonNegative: context={:?}, variant={:?}", context, variant);
+                self.check_variant_non_negative(context, variant)
+            }
+            Constraint::Fold {
                 context,
                 var,
-                refinement, 
+                refinement,
                 ..
-            } => self.check_fold(context, var, refinement),
+            } => {
+                //println!("[DEBUG check_constraint] Fold: context={:?}, var={:?}, refinement={:?}", context, var, refinement);
+                self.check_fold(context, var, refinement)
+            }
         }
     }
 
@@ -350,10 +446,16 @@ impl<'ctx> ConstraintSolver<'ctx> {
 
     /// Check well-formedness: all free variables in refinement are in scope
     fn check_well_formed(&self, context: &TypeContext, template: &Template) -> SolverResult<bool> {
+        println!("[CHECK_WF] Template: {}", template);
         if let Some(refinement) = template.refinement() {
             let free_vars = self.extract_free_variables(refinement);
-            for var in free_vars {
-                if !context.in_scope(&var) {
+            println!("[CHECK_WF] Free vars in refinement: {:?}", free_vars);
+            for var in &free_vars {
+                println!("[CHECK_WF] Checking if '{}' is in scope", var);
+                if !context.in_scope(var) {
+                    println!("[CHECK_WF] Variable '{}' NOT in scope!", var);
+                    let binding_names: Vec<_> = context.bindings().iter().map(|(name, _)| name).collect();
+                    println!("[CHECK_WF] Context bindings: {:?}", binding_names);
                     return Ok(false);
                 }
             }
@@ -375,11 +477,18 @@ impl<'ctx> ConstraintSolver<'ctx> {
             return Ok(false);
         }
 
-        lhs.replace_binder("__self");
-        rhs.replace_binder("__self");
+        // Clone RHS to avoid permanent mutation of the constraint
+        let mut rhs_aligned = rhs.clone();
+        rhs_aligned.replace_binder(lhs.binder());
+
         let lhs_pred = self.get_predicate(lhs);
-        let rhs_pred = self.get_predicate(rhs);
-        println!("lhs_pred: {:?}, rhs_pred: {:?}", lhs_pred, rhs_pred);
+        let rhs_pred = self.get_predicate(&rhs_aligned);
+
+        // If RHS has liquid variable that is still True, force strengthening
+        if rhs_aligned.liquid_var().is_some() && matches!(rhs_pred, Predicate::True(..)) {
+            println!("[CHECK_SUBTYPE] Forcing strengthening for {} with liquid var κ{}", rhs_aligned, rhs_aligned.liquid_var().unwrap().0);
+            return Ok(false);
+        }
 
         // Check implication: context ∧ lhs_pred ⇒ rhs_pred
         self.check_implication(context, &lhs_pred, &rhs_pred)
@@ -498,13 +607,24 @@ impl<'ctx> ConstraintSolver<'ctx> {
 
     fn check_variant_decreases(
         &mut self,
-        entry_context: &TypeContext,
-        preservation_context: &TypeContext,
-        variant: &RefinementExpr,
+        context: &TypeContext,
+        variant_before: &RefinementExpr,
+        variant_after: &RefinementExpr,
     ) -> Result<bool, SolverError> {
+        // Build predicate: V_after < V_before (strict decrease)
+        let pred = Predicate::BinRel {
+            op: RelOp::Lt,
+            lhs: variant_after.clone(),
+            rhs: variant_before.clone(),
+            id: NodeId::new(0),
+            source_ref: SourceRef::unknown(),
+        };
 
-        println!("Check variant decreases unimplemented. Always valid");
-        return Ok(true)
+        self.check_implication(
+            context,
+            &Predicate::True(NodeId::new(0), SourceRef::unknown()),
+            &pred,
+        )
     }
 
     /// Get the predicate for a template under current assignment
@@ -907,71 +1027,304 @@ impl<'ctx> ConstraintSolver<'ctx> {
             return Ok(true); // False implies anything
         }
 
-        let assumptions = context.assumptions();
+        // Collect explicit assumptions
+        let mut all_assumptions: Vec<Predicate> = context.assumptions().to_vec();
+
+        // Collect variables mentioned in antecedent and consequent
+        let mut vars = HashSet::new();
+        self.collect_vars_from_predicate(antecedent, &mut vars);
+        self.collect_vars_from_predicate(consequent, &mut vars);
+
+        // Add refinements for relevant bindings (both Concrete and Liquid)
+        for var_name in &vars {
+            // Try direct lookup first (SSA name), then resolve source name → SSA name
+            let template = if let Some(t) = context.lookup(var_name) {
+                t
+            } else if let Some(ssa_name) = context.source_to_ssa().get(var_name) {
+                if let Some(t) = context.lookup(ssa_name) {
+                    t
+                } else {
+                    continue;
+                }
+            } else {
+                continue;
+            };
+
+            let pred = if let Some(refinement) = template.refinement() {
+                Some(refinement.clone())
+            } else if let Some(liquid_var) = template.liquid_var() {
+                self.assignment.get(liquid_var).cloned()
+            } else {
+                None
+            };
+
+            if let Some(pred) = pred {
+                // Substitute binder with the variable name used in the predicate
+                let binder = template.binder();
+                if binder != var_name {
+                    let mut subst = std::collections::HashMap::new();
+                    subst.insert(binder.to_string(), var_name.clone());
+                    all_assumptions.push(pred.substitute_vars(&subst));
+                } else {
+                    all_assumptions.push(pred);
+                }
+            }
+        }
+
         self.smt_solver
-            .is_valid_implication(assumptions, antecedent, consequent)
+            .is_valid_implication(&all_assumptions, antecedent, consequent)
             .map_err(|e| SolverError::InternalError {
                 message: format!("SMT error: {}", e),
             })
     }
 
     /// Strengthen assignment to satisfy a constraint
-    fn strengthen_for_constraint(&mut self, constraint: &Constraint) -> SolverResult<bool> {
+    fn strengthen_for_constraint(&mut self, constraint: &Constraint, all_constraints: &[Constraint]) -> SolverResult<bool> {
         match constraint {
             Constraint::Subtype {
-                context, sub, sup, location
+                context, sub, sup, ..
             } => {
                 // If rhs has a liquid variable, try to strengthen it
                 if let Some(kappa) = sup.liquid_var() {
-                    return self.strengthen_liquid_var(kappa, context, sub);
+                    return self.strengthen_liquid_var_multi_path(kappa, context, sub, all_constraints);
                 }
+                // No liquid variable - can't strengthen during this phase
+                // Will be checked at final verification
+                Ok(false)
+            }
+            // Hard constraints: if they fail, the program is ill-typed
+            Constraint::LoopInvariantEntry { invariant, location, .. } => {
                 Err(SolverError::TypeMismatch {
                     message: format!(
-                        "Type error: cannot satisfy subtyping constraint\n\
-                        Expected: {}\n\
-                        Found: {}\n\
+                        "Loop invariant does not hold at entry\n\
+                        Invariant: {}\n\
                         Location: {:?}",
-                        sup,   // El tipo esperado
-                        sub,   // El tipo que tenemos
-                        location
+                        invariant, location
                     )
                 })
             }
-            _ => Ok(false), // Only strengthen for Subtype constraints
+            Constraint::LoopInvariantPreservation { invariant, location, .. } => {
+                Err(SolverError::TypeMismatch {
+                    message: format!(
+                        "Loop invariant is not preserved by loop body\n\
+                        Invariant: {}\n\
+                        Location: {:?}",
+                        invariant, location
+                    )
+                })
+            }
+            Constraint::LoopVariantDecreases { variant_before, variant_after, location, .. } => {
+                Err(SolverError::TypeMismatch {
+                    message: format!(
+                        "Loop variant does not decrease\n\
+                        Before: {}\n\
+                        After: {}\n\
+                        Location: {:?}",
+                        variant_before, variant_after, location
+                    )
+                })
+            }
+            Constraint::LoopVariantNonNegative { variant, location, .. } => {
+                Err(SolverError::TypeMismatch {
+                    message: format!(
+                        "Loop variant may be negative\n\
+                        Variant: {}\n\
+                        Location: {:?}",
+                        variant, location
+                    )
+                })
+            }
+            Constraint::Requires { condition, location, .. } => {
+                Err(SolverError::TypeMismatch {
+                    message: format!(
+                        "Requires clause not satisfied at call site\n\
+                        Condition: {}\n\
+                        Location: {:?}",
+                        condition, location
+                    )
+                })
+            }
+            Constraint::Ensures { condition, location, .. } => {
+                Err(SolverError::TypeMismatch {
+                    message: format!(
+                        "Ensures clause not provable\n\
+                        Condition: {}\n\
+                        Location: {:?}",
+                        condition, location
+                    )
+                })
+            }
+            Constraint::Fold { var, refinement, location, .. } => {
+                Err(SolverError::TypeMismatch {
+                    message: format!(
+                        "Fold: storage invariant not satisfied\n\
+                        Variable: {}\n\
+                        Refinement: {}\n\
+                        Location: {:?}",
+                        var, refinement, location
+                    )
+                })
+            }
+            _ => Ok(false), // WellFormed, BinaryOp, UnaryOp — strengthened via liquid vars
         }
     }
 
     /// Strengthen a liquid variable by adding qualifiers
-    fn strengthen_liquid_var(
+    fn strengthen_liquid_var_multi_path(
         &mut self,
         var: LiquidVar,
         context: &TypeContext,
         lhs: &Template,
+        all_constraints: &[Constraint],
     ) -> SolverResult<bool> {
-        // Generate candidate qualifiers
-        let candidates = self.qualifiers.instantiate_all(context);
+        let all_constraints_for_var: Vec<_> = all_constraints
+            .iter()
+            .filter_map(|c| {
+                if let Constraint::Subtype { context, sub, sup, .. } = c {
+                    if sup.liquid_var() == Some(var) {
+                        Some((context.clone(), sub.clone(), sup.clone()))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            })
+            .collect();
 
-        // Current predicate
-        let current = self
+        println!("[MULTI_PATH] Strengthening κ{} with {} constraints", var.0, all_constraints_for_var.len());
+
+        // Extract relevant variables from the LHS template (for relevance pruning)
+        // Only include variables that actually appear in the LHS refinement
+        let mut relevant_vars = HashSet::new();
+        if let Some(lhs_refinement) = lhs.refinement() {
+            self.collect_vars_from_predicate(lhs_refinement, &mut relevant_vars);
+        }
+        // If no specific variables in LHS, use empty set (all candidates equally relevant)
+
+        // Get candidates with relevance prioritization
+        let candidates = self.qualifiers.instantiate_all_with_relevance(context, &relevant_vars);
+        println!("[MULTI_PATH] Testing {} candidates (relevant vars: {:?})",
+                 candidates.len(),
+                 if relevant_vars.is_empty() {
+                     "none (all equally relevant)".to_string()
+                 } else {
+                     format!("{:?}", relevant_vars)
+                 });
+
+        let mut current = self
             .assignment
             .get(var)
             .cloned()
             .unwrap_or(Predicate::True(NodeId::new(0), SourceRef::unknown()));
 
-        // Try adding each candidate
+        // Greedy strengthening: agregar qualifiers mientras funcionen
+        // Use adaptive limits: more simple qualifiers, fewer complex ones
+        let mut changed = false;
+        let mut simple_count = 0; // arity 0-1
+        let mut complex_count = 0; // arity 2+
+
+        // Adaptive limits based on qualifier complexity
+        const MAX_SIMPLE_QUALIFIERS: usize = 5;  // Allow more simple qualifiers
+        const MAX_COMPLEX_QUALIFIERS: usize = 2; // Restrict complex ones
+
         for candidate in candidates {
+            // Determine qualifier complexity by checking if it mentions multiple variables
+            let complexity = Self::estimate_predicate_complexity(&candidate);
+            let is_simple = complexity <= 1;
+
+            // Check if we've hit the limit for this complexity class
+            if is_simple && simple_count >= MAX_SIMPLE_QUALIFIERS {
+                continue;
+            }
+            if !is_simple && complex_count >= MAX_COMPLEX_QUALIFIERS {
+                continue;
+            }
+
             let strengthened = self.conjoin(&current, &candidate);
 
-            // Check if this helps satisfy the constraint
-            let lhs_pred = self.get_predicate(lhs);
-            if self.check_implication(context, &lhs_pred, &strengthened)? {
-                self.assignment.assign(var, strengthened);
+            let mut works_for_all_paths = true;
+            for (path_context, path_lhs, _path_rhs) in &all_constraints_for_var {
+                let lhs_pred = self.get_predicate(path_lhs);
+                if !self.check_implication(path_context, &lhs_pred, &strengthened)? {
+                    works_for_all_paths = false;
+                    break;
+                }
+            }
+
+            if works_for_all_paths {
+                println!("[MULTI_PATH] Adding {} qualifier: {}",
+                         if is_simple { "simple" } else { "complex" }, candidate);
+                current = strengthened;
+                changed = true;
+                if is_simple {
+                    simple_count += 1;
+                } else {
+                    complex_count += 1;
+                }
+            }
+        }
+
+        if changed {
+            println!("[MULTI_PATH] Final: κ{} = {}", var.0, current);
+            self.assignment.assign(var, current);
+            return Ok(true);
+        }
+
+        // Si no se encontró qualifier, propagar refinement concreto del LHS
+        // SIN hacer substitución de binders - confiar en que el contexto tenga las equalities
+        if all_constraints_for_var.len() == 1 {
+            let (_, lhs_template, _rhs_template) = &all_constraints_for_var[0];
+            let lhs_pred = self.get_predicate(lhs_template);
+
+            if !matches!(lhs_pred, Predicate::True(..)) {
+                println!("[MULTI_PATH] Propagating LHS refinement AS-IS: {}", lhs_pred);
+                self.assignment.assign(var, lhs_pred);
                 return Ok(true);
             }
         }
 
+        println!("[MULTI_PATH] No qualifier worked for κ{}", var.0);
         Ok(false)
     }
+
+    // fn strengthen_liquid_var(
+    //     &mut self,
+    //     var: LiquidVar,
+    //     context: &TypeContext,
+    //     lhs: &Template,
+    // ) -> SolverResult<bool> {
+    //     // Extract relevant variables for relevance pruning
+    //     let mut relevant_vars = HashSet::new();
+    //     if let Some(lhs_refinement) = lhs.refinement() {
+    //         self.collect_vars_from_predicate(lhs_refinement, &mut relevant_vars);
+    //     }
+
+    //     // Generate candidate qualifiers with relevance
+    //     let candidates = self.qualifiers.instantiate_all_with_relevance(context, &relevant_vars);
+
+    //     // Current predicate
+    //     let current = self
+    //         .assignment
+    //         .get(var)
+    //         .cloned()
+    //         .unwrap_or(Predicate::True(NodeId::new(0), SourceRef::unknown()));
+
+    //     // Try adding each candidate
+    //     for candidate in candidates {
+    //         let strengthened = self.conjoin(&current, &candidate);
+    //         println!("Strengthened: {strengthened}");
+
+    //         // Check if this helps satisfy the constraint
+    //         let lhs_pred = self.get_predicate(lhs);
+    //         if self.check_implication(context, &lhs_pred, &strengthened)? {
+    //             self.assignment.assign(var, strengthened);
+    //             return Ok(true);
+    //         }
+    //     }
+
+    //     Ok(false)
+    // }
 
     /// Conjoin two predicates: p₁ ∧ p₂
     fn conjoin(&self, p1: &Predicate, p2: &Predicate) -> Predicate {
@@ -1026,7 +1379,7 @@ impl<'ctx> ConstraintSolver<'ctx> {
     fn collect_vars_from_expr(&self, expr: &RefinementExpr, vars: &mut HashSet<String>) {
         match expr {
             RefinementExpr::Var(name, ..) => {
-                if name != "v" {
+                if name != "__self" {
                     vars.insert(name.clone());
                 }
             }
@@ -1041,6 +1394,67 @@ impl<'ctx> ConstraintSolver<'ctx> {
                 for arg in args {
                     self.collect_vars_from_expr(arg, vars);
                 }
+            }
+            _ => {}
+        }
+    }
+
+    /// Estimate the complexity of a predicate based on unique variables mentioned
+    /// (excluding special binders like "ν" and "__self")
+    ///
+    /// Returns:
+    /// - 0: constant predicates (no variables)
+    /// - 1: predicates with one variable
+    /// - 2+: predicates with multiple variables (more complex)
+    fn estimate_predicate_complexity(pred: &Predicate) -> usize {
+        let mut vars = HashSet::new();
+        Self::collect_vars_for_complexity(pred, &mut vars);
+        vars.len()
+    }
+
+    fn collect_vars_for_complexity(pred: &Predicate, vars: &mut HashSet<String>) {
+        match pred {
+            Predicate::Var(name, ..) => {
+                if name != "ν" && name != "__self" {
+                    vars.insert(name.clone());
+                }
+            }
+            Predicate::BinRel { lhs, rhs, .. } => {
+                Self::collect_expr_vars_for_complexity(lhs, vars);
+                Self::collect_expr_vars_for_complexity(rhs, vars);
+            }
+            Predicate::And(p1, p2, ..) | Predicate::Or(p1, p2, ..) | Predicate::Implies(p1, p2, ..) => {
+                Self::collect_vars_for_complexity(p1, vars);
+                Self::collect_vars_for_complexity(p2, vars);
+            }
+            Predicate::Not(p, ..) => {
+                Self::collect_vars_for_complexity(p, vars);
+            }
+            _ => {}
+        }
+    }
+
+    fn collect_expr_vars_for_complexity(expr: &RefinementExpr, vars: &mut HashSet<String>) {
+        match expr {
+            RefinementExpr::Var(name, ..) => {
+                if name != "ν" && name != "__self" {
+                    vars.insert(name.clone());
+                }
+            }
+            RefinementExpr::BinOp { lhs, rhs, .. } => {
+                Self::collect_expr_vars_for_complexity(lhs, vars);
+                Self::collect_expr_vars_for_complexity(rhs, vars);
+            }
+            RefinementExpr::UnaryOp { expr, .. } => {
+                Self::collect_expr_vars_for_complexity(expr, vars);
+            }
+            RefinementExpr::UninterpFn { args, .. } => {
+                for arg in args {
+                    Self::collect_expr_vars_for_complexity(arg, vars);
+                }
+            }
+            RefinementExpr::Old { expr, .. } => {
+                Self::collect_expr_vars_for_complexity(expr, vars);
             }
             _ => {}
         }

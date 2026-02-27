@@ -1,7 +1,5 @@
 use std::fmt;
 
-use crate::expression::{BinaryOperator, Expression, Literal};
-
 use crate::meta::SourceRef;
 use crate::node_id::NodeId;
 use crate::predicate::Predicate;

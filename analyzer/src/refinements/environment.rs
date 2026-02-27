@@ -2,7 +2,7 @@ use crate::refinements::constraints::TypeContext;
 use crate::refinements::templates::{LiquidVar, LiquidVarGenerator, Template};
 use merak_ast::predicate::Predicate;
 use merak_ast::types::Type;
-use merak_symbols::{SymbolId, SymbolInfo, SymbolNamespace, SymbolTable};
+use merak_symbols::{SymbolId, SymbolInfo, SymbolTable};
 use std::collections::HashMap;
 
 /// Type environment for refinement inference
@@ -29,6 +29,14 @@ pub struct TypeEnvironment<'a> {
 
     /// Current function being analyzed (if any)
     current_function: Option<SymbolId>,
+
+    /// Maps source-level variable names to their current SSA register names.
+    /// e.g., "i" -> "i_0", updated to "i" -> "i_1" after reassignment in loop body.
+    source_to_ssa: HashMap<String, String>,
+
+    /// Equality facts from Copy/BinaryOp instructions (e.g., i_2 = __temp_1_1).
+    /// Separate from assumptions so they don't interfere with push/pop for path conditions.
+    local_facts: Vec<Predicate>,
 }
 
 impl<'a> TypeEnvironment<'a> {
@@ -40,16 +48,13 @@ impl<'a> TypeEnvironment<'a> {
             local_bindings: HashMap::new(),
             assumptions: Vec::new(),
             current_function: None,
+            source_to_ssa: HashMap::new(),
+            local_facts: Vec::new(),
         }
     }
 
     /// Get the symbol table
     pub fn symbol_table(&self) -> &SymbolTable {
-        self.symbol_table
-    }
-
-    /// Get mutable access to symbol table
-    pub fn symbol_table_mut(&mut self) -> &mut SymbolTable {
         self.symbol_table
     }
 
@@ -68,11 +73,13 @@ impl<'a> TypeEnvironment<'a> {
         self.current_function = None;
         self.local_bindings.clear();
         self.assumptions.clear();
+        self.source_to_ssa.clear();
+        self.local_facts.clear();
     }
 
     /// Get the current function
     pub fn current_function(&self) -> Option<SymbolId> {
-        self.current_function
+        self.current_function.clone()
     }
 
     /// Bind a local variable to a template
@@ -80,38 +87,40 @@ impl<'a> TypeEnvironment<'a> {
         self.local_bindings.insert(name, template);
     }
 
+    /// Add an equality fact from a Copy or BinaryOp instruction.
+    /// Unlike assumptions, these are not managed by push/pop.
+    pub fn add_local_fact(&mut self, fact: Predicate) {
+        self.local_facts.push(fact);
+    }
+
+    /// Update the source-to-SSA mapping for a named variable
+    pub fn track_source_ssa(&mut self, source_name: String, ssa_name: String) {
+        self.source_to_ssa.insert(source_name, ssa_name);
+    }
+
+    /// Get the current source-to-SSA mapping (snapshot for constraint generation)
+    pub fn source_to_ssa_mapping(&self) -> &HashMap<String, String> {
+        &self.source_to_ssa
+    }
+
     /// Unbind a local variable
-    pub fn unbind_local(&mut self, name: &str) -> Option<Template> {
-        self.local_bindings.remove(name)
+    // pub fn unbind_local(&mut self, name: &str) -> Option<Template> {
+    //     self.local_bindings.remove(name)
+    // }
+
+    /// Returns a reference to the local bindings map (register name -> Template)
+    pub fn local_bindings(&self) -> &HashMap<String, Template> {
+        &self.local_bindings
     }
 
     pub fn get_local(&self, name: &str) -> Option<Template> {
-        self.local_bindings.get(name).cloned()
+        self.local_bindings.get(name).cloned().map(|mut t| {
+            println!("Template (name: {name}): {t}");
+            t.replace_binder(name);
+            println!("New: {t}");
+            t
+        })
     }
-
-    pub fn lookup(&self, name: &str) -> Option<Template> {
-        self.local_bindings.get(name).cloned()
-    }
-
-    /// Look up a variable (checks locals first, then symbol table)
-    // pub fn lookup(&self, name: &str) -> Option<Template> {
-    //     // First check local bindings
-    //     if let Some(template) = self.local_bindings.get(name) {
-    //         return Some(template.clone());
-    //     }
-
-    //     // Then check symbol table
-    //     if let Some(symbol_id) = self.symbol_table.lookup(name, SymbolNamespace::Value) {
-    //         let symbol = self.symbol_table.get_symbol(symbol_id);
-    //         if let Some(ty) = &symbol.ty {
-    //             // Clone liquid_gen for the conversion
-    //             let mut gen = self.liquid_gen.clone();
-    //             return Some(Template::from_type(ty, &mut gen));
-    //         }
-    //     }
-
-    //     None
-    // }
 
     /// Add a path assumption (from if/while guard)
     pub fn add_assumption(&mut self, predicate: Predicate) {
@@ -122,66 +131,6 @@ impl<'a> TypeEnvironment<'a> {
     pub fn pop_assumption(&mut self) -> Option<Predicate> {
         self.assumptions.pop()
     }
-
-    /// Get all current assumptions
-    pub fn assumptions(&self) -> &[Predicate] {
-        &self.assumptions
-    }
-
-    /// Clear all assumptions (when exiting a guarded scope)
-    pub fn clear_assumptions(&mut self) {
-        self.assumptions.clear();
-    }
-
-    // /// Execute a closure with an additional assumption
-    // ///
-    // /// This is the safe way to work with guarded scopes (if/while bodies).
-    // /// The assumption is automatically removed when the closure returns.
-    // ///
-    // /// # Example
-    // /// ```
-    // /// env.with_assumption_scoped(condition, |env| {
-    // ///     // Inside this scope, env has the additional assumption
-    // ///     generate_constraints_for_then_branch(env);
-    // /// });
-    // /// // Outside the scope, assumption is automatically removed
-    // /// ```
-    // pub fn with_assumption_scoped<F, R>(&mut self, predicate: Predicate, f: F) -> R
-    // where
-    //     F: FnOnce(&mut TypeEnvironment<'a>) -> R,
-    // {
-    //     // Push assumption
-    //     self.assumptions.push(predicate);
-
-    //     // Execute closure
-    //     let result = f(self);
-
-    //     // Pop assumption (cleanup)
-    //     self.assumptions.pop();
-
-    //     result
-    // }
-
-    // /// Execute a closure with multiple additional assumptions
-    // ///
-    // /// All assumptions are automatically removed when the closure returns.
-    // pub fn with_assumptions_scoped<F, R>(&mut self, predicates: Vec<Predicate>, f: F) -> R
-    // where
-    //     F: FnOnce(&mut TypeEnvironment<'a>) -> R,
-    // {
-    //     let count = predicates.len();
-
-    //     // Push all assumptions
-    //     self.assumptions.extend(predicates);
-
-    //     // Execute closure
-    //     let result = f(self);
-
-    //     // Pop all assumptions (cleanup)
-    //     self.assumptions.truncate(self.assumptions.len() - count);
-
-    //     result
-    // }
 
     /// Create a TypeContext snapshot for constraint generation
     pub fn to_type_context(&self) -> TypeContext {
@@ -197,104 +146,33 @@ impl<'a> TypeEnvironment<'a> {
             ctx.assume(assumption.clone());
         }
 
+        // Add equality facts from Copy/BinaryOp instructions
+        for fact in &self.local_facts {
+            ctx.assume(fact.clone());
+        }
+
+        // Carry source-to-SSA mapping for cross-variable reference resolution
+        ctx.set_source_to_ssa(self.source_to_ssa.clone());
+
         ctx
     }
 
-    pub fn get_symbol(&self, symbol_id: SymbolId) -> &SymbolInfo {
+    pub fn get_symbol(&self, symbol_id: &SymbolId) -> &SymbolInfo {
         self.symbol_table.get_symbol(symbol_id)
     } 
 
     /// Get the type of a symbol from the symbol table
-    pub fn get_symbol_type(&self, symbol_id: SymbolId) -> Option<&Type> {
+    pub fn get_symbol_type(&self, symbol_id: &SymbolId) -> Option<&Type> {
         self.symbol_table.get_symbol(symbol_id).ty.as_ref()
     }
 
-    /// Update the type of a symbol in the symbol table
-    pub fn update_symbol_type(&mut self, symbol_id: SymbolId, ty: Type) {
-        self.symbol_table.get_symbol_mut(symbol_id).ty = Some(ty);
-    }
-
     /// Get the template for a symbol (liquid/concrete)
-    pub fn get_symbol_template(&mut self, symbol_id: SymbolId) -> Option<Template> {
+    pub fn get_symbol_template(&mut self, symbol_id: &SymbolId) -> Option<Template> {
         self.symbol_table
             .get_symbol(symbol_id)
             .ty
             .as_ref()
             .map(|ty| Template::from_type(ty, &mut self.liquid_gen))
     }
-
-    /// Check if a variable is in scope (local or global)
-    pub fn in_scope(&self, name: &str) -> bool {
-        self.local_bindings.contains_key(name)
-            || self
-                .symbol_table
-                .lookup(name, SymbolNamespace::Value)
-                .is_some()
-    }
-
-    /// Get all variables in scope
-    pub fn get_variables_in_scope(&self) -> Vec<String> {
-        let mut vars = Vec::new();
-
-        // Add local bindings
-        vars.extend(self.local_bindings.keys().cloned());
-
-        // Add symbols from symbol table
-        for (symbol_id, symbol) in self.symbol_table.all_symbols() {
-            let name = symbol.qualified_name.parts.last().unwrap().clone();
-            if !vars.contains(&name) {
-                vars.push(name);
-            }
-        }
-
-        vars
-    }
-
-    /// Get the number of current assumptions
-    pub fn assumption_depth(&self) -> usize {
-        self.assumptions.len()
-    }
-
-    /// Check if we're currently in a guarded scope
-    pub fn is_guarded(&self) -> bool {
-        !self.assumptions.is_empty()
-    }
 }
 
-// /// Helper struct for managing scoped local bindings
-// ///
-// /// This ensures bindings are cleaned up even in early returns or panics
-// pub struct ScopedBinding<'a, 'env> {
-//     env: &'a mut TypeEnvironment<'env>,
-//     name: String,
-// }
-
-// impl<'a, 'env> ScopedBinding<'a, 'env> {
-//     /// Create a new scoped binding
-//     pub fn new(env: &'a mut TypeEnvironment<'env>, name: String, template: Template) -> Self {
-//         env.bind_local(name.clone(), template);
-//         Self { env, name }
-//     }
-// }
-
-// impl<'a, 'env> Drop for ScopedBinding<'a, 'env> {
-//     fn drop(&mut self) {
-//         self.env.unbind_local(&self.name);
-//     }
-// }
-
-// impl<'a> TypeEnvironment<'a> {
-//     /// Create a scoped local binding that is automatically cleaned up
-//     ///
-//     /// # Example
-//     /// ```
-//     /// {
-//     ///     let _binding = env.scoped_binding("temp".to_string(), template);
-//     ///     // temp is in scope here
-//     /// }
-//     /// // temp is automatically removed when _binding is dropped
-//     /// ```
-//     pub fn scoped_binding(&mut self, name: String, template: Template) -> ScopedBinding<'_, 'a> {
-//         ScopedBinding::new(self, name, template)
-//     }
-// }

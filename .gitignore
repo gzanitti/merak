@@ -2,3 +2,10 @@
 Cargo.lock
 pipeline.txt
 target/
+data/
+flamegraph.svg
+*.bak
+refinements.md
+random_todo.txt
+perf.data*
+build/

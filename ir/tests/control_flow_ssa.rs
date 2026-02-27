@@ -10,8 +10,7 @@ use common::{assert_predecessors, build_ssa_from_source, get_phi_nodes, get_sing
 #[test]
 fn test_simple_if_then_cfg_structure() {
     let source = r#"
-        contract Test[Active] {}
-        Test@Active(any) {
+        contract Test {
             entrypoint foo(x: int) {
                 if (x > 0) {
                     var y: int = 1;
@@ -22,7 +21,7 @@ fn test_simple_if_then_cfg_structure() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     // If-then (no else) should create at least 3 blocks:
     // - entry (evaluates condition, has Branch terminator)
@@ -52,8 +51,7 @@ fn test_simple_if_then_cfg_structure() {
         Terminator::Branch {
             then_block,
             else_block,
-            invariants,
-            variants,
+            meta,
             ..
         } => {
             // For if-then (no else), else_block should jump directly to exit
@@ -69,10 +67,10 @@ fn test_simple_if_then_cfg_structure() {
 
             // Invariants and variants should be empty (not a loop)
             assert!(
-                invariants.is_empty(),
+                meta.loop_invariants.is_empty(),
                 "If statement should have no invariants"
             );
-            assert!(variants.is_empty(), "If statement should have no variants");
+            assert!(meta.loop_variants.is_empty(), "If statement should have no variants");
         }
         other => panic!("Expected Branch terminator, got {:?}", other),
     }
@@ -93,8 +91,7 @@ fn test_simple_if_then_cfg_structure() {
 #[test]
 fn test_if_then_else_cfg_structure() {
     let source = r#"
-        contract Test[Active] {}
-        Test@Active(any) {
+        contract Test {
             entrypoint foo(x: int) {
                 if (x > 0) {
                     var y: int = 1;
@@ -107,7 +104,7 @@ fn test_if_then_else_cfg_structure() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     println!("CFG {cfg:?}");
 
@@ -137,8 +134,7 @@ fn test_if_then_else_cfg_structure() {
         Terminator::Branch {
             then_block,
             else_block,
-            invariants,
-            variants,
+            meta,
             ..
         } => {
             assert!(
@@ -178,8 +174,8 @@ fn test_if_then_else_cfg_structure() {
             }
 
             // No loop invariants/variants
-            assert!(invariants.is_empty());
-            assert!(variants.is_empty());
+            assert!(meta.loop_invariants.is_empty());
+            assert!(meta.loop_variants.is_empty());
         }
         other => panic!("Expected Branch terminator, got {:?}", other),
     }
@@ -197,8 +193,7 @@ fn test_if_then_else_cfg_structure() {
 #[test]
 fn test_nested_if_statements_structure() {
     let source = r#"
-        contract Test[Active] {}
-        Test@Active(any) {
+        contract Test {
             entrypoint foo(x: int, y: int) {
                 if (x > 0) {
                     if (y > 0) {
@@ -211,7 +206,7 @@ fn test_nested_if_statements_structure() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     println!("CFG {cfg:?}");
 
@@ -502,8 +497,7 @@ fn test_nested_if_statements_structure() {
 #[test]
 fn test_simple_while_loop_structure() {
     let source = r#"
-        contract Test[Active] {}
-        Test@Active(any) {
+        contract Test {
             entrypoint foo() {
                 var i: int = 0;
                 while (i < 10)
@@ -517,7 +511,7 @@ fn test_simple_while_loop_structure() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     // While loop should create at least 3-4 blocks:
     // - entry/pre-loop block (setup)
@@ -539,10 +533,9 @@ fn test_simple_while_loop_structure() {
         .values()
         .find(|b| match &b.terminator {
             Terminator::Branch {
-                invariants,
-                variants,
+                meta,
                 ..
-            } => !invariants.is_empty() && !variants.is_empty(),
+            } => !meta.loop_invariants.is_empty() && !meta.loop_variants.is_empty(),
             _ => false,
         })
         .expect("Should have loop header with invariants and variants");
@@ -550,13 +543,12 @@ fn test_simple_while_loop_structure() {
     match &header.terminator {
         Terminator::Branch {
             then_block,
-            invariants,
-            variants,
+            meta,
             ..
         } => {
             // Loop should have non-empty invariants and variants
-            assert!(!invariants.is_empty(), "Loop should have invariants");
-            assert!(!variants.is_empty(), "Loop should have variants");
+            assert!(!meta.loop_invariants.is_empty(), "Loop should have invariants");
+            assert!(!meta.loop_variants.is_empty(), "Loop should have variants");
 
             // Then block is the loop body, else block is the exit
             let body = &cfg.blocks[then_block];
@@ -604,8 +596,7 @@ fn test_simple_while_loop_structure() {
 #[test]
 fn test_phi_node_at_if_merge_point() {
     let source = r#"
-        contract Test[Active] {}
-        Test@Active(any) {
+        contract Test {
             entrypoint foo(cond: bool) -> int {
                 var x: int = 0;
                 if (cond) {
@@ -620,7 +611,7 @@ fn test_phi_node_at_if_merge_point() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     // Find the exit/merge block (has Return terminator and phi nodes)
     let exit = cfg
@@ -673,8 +664,7 @@ fn test_phi_node_at_if_merge_point() {
 #[test]
 fn test_phi_node_at_if_then_merge_no_else() {
     let source = r#"
-        contract Test[Active] {}
-        Test@Active(any) {
+        contract Test {
             entrypoint foo(cond: bool) -> int {
                 var x: int = 0;
                 if (cond) {
@@ -687,7 +677,7 @@ fn test_phi_node_at_if_then_merge_no_else() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     // Find exit block with phi nodes
     let exit = cfg
@@ -721,8 +711,7 @@ fn test_phi_node_at_if_then_merge_no_else() {
 #[test]
 fn test_multiple_variables_multiple_phis() {
     let source = r#"
-        contract Test[Active] {}
-        Test@Active(any) {
+        contract Test {
             entrypoint foo(cond: bool) -> int {
                 var x: int = 0;
                 var y: int = 0;
@@ -740,7 +729,7 @@ fn test_multiple_variables_multiple_phis() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     // Find exit block
     let exit = cfg
@@ -772,8 +761,7 @@ fn test_multiple_variables_multiple_phis() {
 #[test]
 fn test_loop_phi_nodes_for_modified_variables() {
     let source = r#"
-        contract Test[Active] {}
-        Test@Active(any) {
+        contract Test {
             entrypoint foo() -> int {
                 var i: int = 0;
                 var sum: int = 0;
@@ -790,7 +778,7 @@ fn test_loop_phi_nodes_for_modified_variables() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     println!("CFG: {:?}", cfg);
 
@@ -800,7 +788,7 @@ fn test_loop_phi_nodes_for_modified_variables() {
         .values()
         .find(|b| {
             let has_branch = match &b.terminator {
-                Terminator::Branch { invariants, .. } => !invariants.is_empty(),
+                Terminator::Branch { meta, .. } => !meta.loop_invariants.is_empty(),
                 _ => false,
             };
             let has_phis = !get_phi_nodes(b).is_empty();
@@ -850,8 +838,7 @@ fn test_loop_phi_nodes_for_modified_variables() {
 #[ignore]
 fn test_no_phi_for_unmodified_variables() {
     let source = r#"
-        contract Test[Active] {}
-        Test@Active(any) {
+        contract Test {
             entrypoint foo(cond: bool) -> int {
                 var x: int = 10;
                 var y: int = 20;
@@ -865,7 +852,7 @@ fn test_no_phi_for_unmodified_variables() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     println!("CFG : {:?}", cfg);
 
@@ -888,8 +875,7 @@ fn test_no_phi_for_unmodified_variables() {
 #[test]
 fn test_ssa_versions_increment_on_assignment() {
     let source = r#"
-        contract Test[Active] {}
-        Test@Active(any) {
+        contract Test {
             entrypoint foo() -> int {
                 var x: int = 0;
                 x = 10;
@@ -901,7 +887,7 @@ fn test_ssa_versions_increment_on_assignment() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     println!("CFG: {:?}", cfg);
 
@@ -930,7 +916,7 @@ fn test_ssa_versions_increment_on_assignment() {
     // Return should use the latest version
     match &entry_block.terminator {
         Terminator::Return {
-            value: Some(merak_ir::ssa_ir::Operand::Register(reg)),
+            value: Some(merak_ir::ssa_ir::Operand::Location(reg)),
             ..
         } => {
             // Should use the last assigned version
@@ -950,8 +936,7 @@ fn test_ssa_versions_increment_on_assignment() {
 #[test]
 fn test_nested_if_phi_placement() {
     let source = r#"
-        contract Test[Active] {}
-        Test@Active(any) {
+        contract Test {
             entrypoint foo(a: bool, b: bool) -> int {
                 var x: int = 0;
                 if (a) {
@@ -967,7 +952,7 @@ fn test_nested_if_phi_placement() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     // Should have phi nodes at merge points
     let blocks_with_phis: Vec<_> = cfg
@@ -1007,8 +992,7 @@ fn test_nested_if_phi_placement() {
 #[test]
 fn test_sequential_if_statements_phi_versions() {
     let source = r#"
-        contract Test[Active] {}
-        Test@Active(any) {
+        contract Test {
             entrypoint foo(a: bool, b: bool) -> int {
                 var x: int = 0;
                 if (a) {
@@ -1024,7 +1008,7 @@ fn test_sequential_if_statements_phi_versions() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     // Should have phi nodes at both if exits
     let blocks_with_phis: Vec<_> = cfg
@@ -1061,8 +1045,7 @@ fn test_sequential_if_statements_phi_versions() {
 #[test]
 fn test_if_after_while_correct_versions() {
     let source = r#"
-        contract Test[Active] {}
-        Test@Active(any) {
+        contract Test {
             entrypoint foo(cond: bool) -> int {
                 var x: int = 0;
                 while (x < 10)
@@ -1080,7 +1063,7 @@ fn test_if_after_while_correct_versions() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     // Should have phi nodes in both loop header and if exit
     let blocks_with_phis: Vec<_> = cfg
@@ -1099,7 +1082,7 @@ fn test_if_after_while_correct_versions() {
         .blocks
         .values()
         .find(|b| match &b.terminator {
-            Terminator::Branch { invariants, .. } => !invariants.is_empty(),
+            Terminator::Branch { meta, .. } => !meta.loop_invariants.is_empty(),
             _ => false,
         })
         .expect("Should have loop header");
@@ -1115,8 +1098,7 @@ fn test_if_after_while_correct_versions() {
 #[test]
 fn test_deeply_nested_control_flow() {
     let source = r#"
-        contract Test[Active] {}
-        Test@Active(any) {
+        contract Test {
             entrypoint foo(a: bool, b: bool, c: bool) {
                 if (a) {
                     if (b) {
@@ -1133,7 +1115,7 @@ fn test_deeply_nested_control_flow() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     // Should create many blocks for nested control flow
     assert!(
@@ -1188,8 +1170,7 @@ fn test_deeply_nested_control_flow() {
 #[test]
 fn test_empty_loop_body() {
     let source = r#"
-        contract Test[Active] {}
-        Test@Active(any) {
+        contract Test {
             entrypoint foo() {
                 while (false)
                     with @invariant(true) @variant(0)
@@ -1200,7 +1181,7 @@ fn test_empty_loop_body() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     // Should still create loop structure with separate header block:
     // - pre-loop/entry
@@ -1217,7 +1198,7 @@ fn test_empty_loop_body() {
         .blocks
         .values()
         .find(|b| match &b.terminator {
-            Terminator::Branch { invariants, .. } => !invariants.is_empty(),
+            Terminator::Branch { meta, .. } => !meta.loop_invariants.is_empty(),
             _ => false,
         })
         .expect("Should have loop header");

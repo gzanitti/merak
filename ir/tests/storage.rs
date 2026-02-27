@@ -13,10 +13,8 @@ use common::{
 #[test]
 fn test_storage_variable_read_generates_load() {
     let source = r#"
-        contract Test[Active] {
+        contract Test {
             state var balance: int = 0;
-        }
-        Test@Active(any) {
             entrypoint get_balance() -> int {
                 return balance;
             }
@@ -25,7 +23,7 @@ fn test_storage_variable_read_generates_load() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     let entry_block = &cfg.blocks[&cfg.entry];
 
@@ -58,7 +56,7 @@ fn test_storage_variable_read_generates_load() {
     // Return should use the temp register from StorageLoad
     match &entry_block.terminator {
         Terminator::Return {
-            value: Some(Operand::Register(reg)),
+            value: Some(Operand::Location(reg)),
             ..
         } => {
             // The register should be from the StorageLoad
@@ -71,10 +69,8 @@ fn test_storage_variable_read_generates_load() {
 #[test]
 fn test_storage_variable_write_generates_store() {
     let source = r#"
-        contract Test[Active] {
+        contract Test {
             state var balance: int = 0;
-        }
-        Test@Active(any) {
             entrypoint set_balance(amount: int) {
                 balance = amount;
             }
@@ -83,7 +79,7 @@ fn test_storage_variable_write_generates_store() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     let entry_block = &cfg.blocks[&cfg.entry];
 
@@ -108,7 +104,7 @@ fn test_storage_variable_write_generates_store() {
 
             // value should be a register (the parameter 'amount')
             match value {
-                Operand::Register(reg) => {
+                Operand::Location(reg) => {
                     // The parameter should be version 0
                     assert_eq!(reg.version, 0, "Parameter should be version 0");
                 }
@@ -122,8 +118,7 @@ fn test_storage_variable_write_generates_store() {
 #[test]
 fn test_local_variable_uses_copy_not_storage() {
     let source = r#"
-        contract Test[Active] {}
-        Test@Active(any) {
+        contract Test {
             entrypoint foo() -> int {
                 var x: int = 10;
                 x = 20;
@@ -134,7 +129,7 @@ fn test_local_variable_uses_copy_not_storage() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     let entry_block = &cfg.blocks[&cfg.entry];
 
@@ -181,10 +176,8 @@ fn test_local_variable_uses_copy_not_storage() {
 #[test]
 fn test_storage_read_after_write() {
     let source = r#"
-        contract Test[Active] {
+        contract Test {
             state var balance: int = 0;
-        }
-        Test@Active(any) {
             entrypoint increment() {
                 balance = balance + 1;
             }
@@ -193,7 +186,7 @@ fn test_storage_read_after_write() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     let entry_block = &cfg.blocks[&cfg.entry];
 
@@ -218,7 +211,7 @@ fn test_storage_read_after_write() {
 
                     // One operand should be the loaded register
                     let uses_loaded = match left {
-                        Operand::Register(reg) => reg == load_dest,
+                        Operand::Location(reg) => reg == load_dest,
                         _ => false,
                     };
 
@@ -240,7 +233,7 @@ fn test_storage_read_after_write() {
                     match &entry_block.instructions[2] {
                         SsaInstruction::StorageStore { value, .. } => {
                             match value {
-                                Operand::Register(reg) => {
+                                Operand::Location(reg) => {
                                     assert_eq!(
                                         reg, binop_dest,
                                         "StorageStore should use BinaryOp result"
@@ -262,11 +255,9 @@ fn test_storage_read_after_write() {
 #[test]
 fn test_multiple_storage_variables() {
     let source = r#"
-        contract Test[Active] {
+        contract Test {
             state var x: int = 0;
             state var y: int = 0;
-        }
-        Test@Active(any) {
             entrypoint swap() {
                 var temp: int = x;
                 x = y;
@@ -277,7 +268,7 @@ fn test_multiple_storage_variables() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     let entry_block = &cfg.blocks[&cfg.entry];
 
@@ -322,10 +313,8 @@ fn test_multiple_storage_variables() {
 #[test]
 fn test_storage_in_loop() {
     let source = r#"
-        contract Test[Active] {
+        contract Test {
             state var counter: int = 0;
-        }
-        Test@Active(any) {
             entrypoint increment_n(n: int) {
                 var i: int = 0;
                 while (i < n)
@@ -340,7 +329,7 @@ fn test_storage_in_loop() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     // Find the loop body block (should contain the counter increment)
     let body_block = cfg
@@ -431,10 +420,8 @@ fn test_storage_in_loop() {
 #[test]
 fn test_parameter_vs_storage_distinction() {
     let source = r#"
-        contract Test[Active] {
+        contract Test {
             state var value: int = 0;
-        }
-        Test@Active(any) {
             entrypoint set_value(new_value: int) {
                 value = new_value;
             }
@@ -443,7 +430,7 @@ fn test_parameter_vs_storage_distinction() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     // Should have 1 parameter (new_value)
     assert_eq!(cfg.parameters.len(), 1, "Should have 1 parameter");
@@ -471,7 +458,7 @@ fn test_parameter_vs_storage_distinction() {
     match &entry_block.instructions[0] {
         SsaInstruction::StorageStore { value, .. } => {
             match value {
-                Operand::Register(reg) => {
+                Operand::Location(reg) => {
                     // Parameter should be version 0
                     assert_eq!(
                         reg.version, 0,
@@ -488,10 +475,8 @@ fn test_parameter_vs_storage_distinction() {
 #[test]
 fn test_state_const_read_only() {
     let source = r#"
-        contract Test[Active] {
+        contract Test {
             state const MAX: int = 100;
-        }
-        Test@Active(any) {
             entrypoint get_max() -> int {
                 return MAX;
             }
@@ -500,7 +485,7 @@ fn test_state_const_read_only() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     let entry_block = &cfg.blocks[&cfg.entry];
 

@@ -11,18 +11,18 @@ pub type ScopeId = usize;
 
 /// Unique identifier for symbols in the symbol table
 /// Acts as an index into the symbol arena for O(1) access
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SymbolId {
     /// Normal symbol from user code (in symbol table)
-    Named(usize),
+    Named(String, usize),
 
     /// Synthetic temporary for intermediate values (NOT in symbol table)
     Temp(usize),
 }
 
 impl SymbolId {
-    pub fn new(index: usize) -> Self {
-        SymbolId::Named(index)
+    pub fn new(name: String, index: usize) -> Self {
+        SymbolId::Named(name, index)
     }
 
     pub fn synthetic_temp(id: usize) -> Self {
@@ -34,16 +34,16 @@ impl SymbolId {
     }
 
     fn as_usize(&self) -> usize {
-        let (&Self::Named(n) | &Self::Temp(n)) = self;
-        n
+        let (&Self::Named(_, i) | &Self::Temp(i)) = self;
+        i
     }
 }
 
 impl fmt::Display for SymbolId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            SymbolId::Named(n) => write!(f, "{}", n),
-            SymbolId::Temp(n) => write!(f, "__temp({})", n),
+            SymbolId::Named(n, _) => write!(f, "{}", n),
+            SymbolId::Temp(n) => write!(f, "__temp_{}", n),
         }
     }
 }
@@ -145,8 +145,8 @@ impl SymbolTable {
         loop {
             let scope = &self.scopes[current];
 
-            if let Some(&symbol_id) = scope.symbols.get(&(name.to_string(), namespace)) {
-                return Some(symbol_id);
+            if let Some(symbol_id) = scope.symbols.get(&(name.to_string(), namespace)) {
+                return Some(symbol_id.clone());
             }
 
             current = match current.checked_sub(1) {
@@ -159,7 +159,7 @@ impl SymbolTable {
     }
 
     /// Get SymbolInfo from the arena by SymbolId - O(1) access
-    pub fn get_symbol(&self, symbol_id: SymbolId) -> &SymbolInfo {
+    pub fn get_symbol(&self, symbol_id: &SymbolId) -> &SymbolInfo {
         &self.symbol_arena[symbol_id.as_usize()]
     }
 
@@ -206,15 +206,15 @@ impl SymbolTable {
         };
 
         // Add to arena and get its ID
-        let symbol_id = SymbolId::new(self.symbol_arena.len());
+        let symbol_id = SymbolId::new(simple_name.clone(), self.symbol_arena.len());
         self.symbol_arena.push(info);
-        self.qualified_names_to_symbol.insert(qualified_name.to_string(), symbol_id);
+        self.qualified_names_to_symbol.insert(qualified_name.to_string(), symbol_id.clone());
 
         // Insert into scope tree
-        self.insert(simple_name, namespace, symbol_id);
+        self.insert(simple_name, namespace, symbol_id.clone());
 
         // Connect with NodeId for O(1) access during type checking
-        self.node_to_symbol.insert(node_id, symbol_id);
+        self.node_to_symbol.insert(node_id, symbol_id.clone());
 
         Ok(symbol_id)
     }
@@ -231,7 +231,7 @@ impl SymbolTable {
         // Look up the symbol in the scope tree
         if let Some(symbol_id) = self.lookup(name, namespace) {
             // Connect this node to the symbol
-            self.node_to_symbol.insert(node_id, symbol_id);
+            self.node_to_symbol.insert(node_id, symbol_id.clone());
             Some(symbol_id)
         } else {
             None
@@ -242,13 +242,13 @@ impl SymbolTable {
     pub fn get_symbol_by_node_id(&self, node_id: NodeId) -> Option<&SymbolInfo> {
         self.node_to_symbol
             .get(&node_id)
-            .map(|&symbol_id| self.get_symbol(symbol_id))
+            .map(|symbol_id| self.get_symbol(symbol_id))
     }
 
     pub fn get_symbol_id_by_node_id(&self, node_id: NodeId) -> Option<SymbolId> {
         self.node_to_symbol
             .get(&node_id)
-            .map(|&symbol_id| symbol_id)
+            .map(|symbol_id| symbol_id.clone())
     }
 
     pub fn get_symbol_mut(&mut self, symbol_id: SymbolId) -> &mut SymbolInfo {
@@ -285,7 +285,7 @@ impl SymbolTable {
         self.symbol_arena
             .iter()
             .enumerate()
-            .map(|(idx, info)| (SymbolId::new(idx), info))
+            .map(|(idx, info)| (SymbolId::new(info.qualified_name.last(), idx), info))
     }
 }
 

@@ -1,0 +1,40 @@
+// Demonstrating requires and ensures clauses
+// These are used for storage-related pre/post-conditions
+
+contract VaultWithContracts {
+    state var balance: {balance: int | balance >= 0} = 0;
+    state var totalDeposits: {totalDeposits: int | totalDeposits >= 0} = 0;
+
+    constructor() {
+        balance = 0;
+        totalDeposits = 0;
+    }
+
+    // Using requires to ensure storage preconditions
+    entrypoint withdraw(amount: {amount: int | amount >= 0})
+        requires(balance >= amount)
+    {
+        if (balance >= amount) {
+            balance = balance - amount;
+        }
+    }
+
+    // Using ensures to guarantee storage postconditions
+    entrypoint deposit(amount: {amount: int | amount >= 0})
+        ensures(balance >= 0)
+    {
+        balance = balance + amount;
+        totalDeposits = totalDeposits + amount;
+    }
+
+    // Combining requires and ensures
+    entrypoint transfer(amount: {amount: int | amount >= 0})
+        requires(balance >= amount)
+        ensures(totalDeposits >= 0)
+    {
+        if (balance >= amount) {
+            balance = balance - amount;
+            totalDeposits = totalDeposits + amount;
+        }
+    }
+}

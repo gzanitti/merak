@@ -21,6 +21,12 @@ impl SourceRef {
     }
 }
 
+impl Default for SourceRef {
+    fn default() -> Self {
+        Self::unknown()
+    }
+}
+
 impl fmt::Display for SourceRef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}..{}", self.start, self.end)

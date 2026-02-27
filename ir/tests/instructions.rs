@@ -13,8 +13,7 @@ use common::{
 #[test]
 fn test_arithmetic_operations_generate_binary_ops() {
     let source = r#"
-        contract Test[Active] {}
-        Test@Active(any) {
+        contract Test {
             entrypoint arithmetic(a: int, b: int) -> int {
                 var sum: int = a + b;
                 var diff: int = a - b;
@@ -27,7 +26,7 @@ fn test_arithmetic_operations_generate_binary_ops() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     let entry_block = &cfg.blocks[&cfg.entry];
 
@@ -57,14 +56,14 @@ fn test_arithmetic_operations_generate_binary_ops() {
 
             // Operands should be registers (parameters or previous results)
             match (left, right) {
-                (Operand::Register(_), Operand::Register(_)) => {
+                (Operand::Location(_), Operand::Location(_)) => {
                     // Both registers - valid
                 }
                 _ => {
                     // At least one should be a register
                     assert!(
-                        matches!(left, Operand::Register(_))
-                            || matches!(right, Operand::Register(_)),
+                        matches!(left, Operand::Location(_))
+                            || matches!(right, Operand::Location(_)),
                         "At least one operand should be a register"
                     );
                 }
@@ -94,8 +93,7 @@ fn test_arithmetic_operations_generate_binary_ops() {
 #[test]
 fn test_comparison_operations() {
     let source = r#"
-        contract Test[Active] {}
-        Test@Active(any) {
+        contract Test {
             entrypoint compare(x: int, y: int) -> bool {
                 var gt: bool = x > y;
                 var lt: bool = x < y;
@@ -107,7 +105,7 @@ fn test_comparison_operations() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     let entry_block = &cfg.blocks[&cfg.entry];
 
@@ -147,8 +145,7 @@ fn test_comparison_operations() {
 #[test]
 fn test_unary_operations() {
     let source = r#"
-        contract Test[Active] {}
-        Test@Active(any) {
+        contract Test {
             entrypoint unary(x: int, flag: bool) -> int {
                 var neg: int = -x;
                 var notflag: bool = !flag;
@@ -159,7 +156,7 @@ fn test_unary_operations() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     let entry_block = &cfg.blocks[&cfg.entry];
 
@@ -181,7 +178,7 @@ fn test_unary_operations() {
 
             // Operand should be a register (parameter)
             match operand {
-                Operand::Register(reg) => {
+                Operand::Location(reg) => {
                     assert!(reg.version >= 0, "Operand should be valid register");
                 }
                 _ => panic!("Operand should be a register"),
@@ -202,8 +199,7 @@ fn test_unary_operations() {
 #[test]
 fn test_complex_expression_uses_temps() {
     let source = r#"
-        contract Test[Active] {}
-        Test@Active(any) {
+        contract Test {
             entrypoint complex(a: int, b: int, c: int) -> int {
                 return (a + b) * (c - a);
             }
@@ -212,7 +208,7 @@ fn test_complex_expression_uses_temps() {
 
     let (ssa_program, _) = build_ssa_from_source(source).expect("Failed to build SSA");
 
-    let cfg = get_single_function_cfg(&ssa_program, "Test", "Active");
+    let cfg = get_single_function_cfg(&ssa_program, "Test");
 
     let entry_block = &cfg.blocks[&cfg.entry];
 
@@ -246,7 +242,7 @@ fn test_complex_expression_uses_temps() {
     // Return should use the last computed value
     match &entry_block.terminator {
         Terminator::Return {
-            value: Some(Operand::Register(_)),
+            value: Some(Operand::Location(_)),
             ..
         } => {
             // Correct - returns a register
@@ -260,8 +256,7 @@ fn test_complex_expression_uses_temps() {
 #[ignore]
 fn test_function_call_internal() {
     let source = r#"
-        contract Test[Active] {}
-        Test@Active(any) {
+        contract Test {
             entrypoint helper(x: int) -> int {
                 return x * 2;
             }
@@ -307,7 +302,7 @@ fn test_function_call_internal() {
             assert_eq!(args.len(), 1, "Should have 1 argument");
 
             match &args[0] {
-                Operand::Register(reg) => {
+                Operand::Location(reg) => {
                     assert!(reg.version >= 0, "Argument should be valid register");
                 }
                 _ => panic!("Argument should be a register"),
@@ -322,8 +317,7 @@ fn test_function_call_internal() {
 #[ignore]
 fn test_function_call_void() {
     let source = r#"
-        contract Test[Active] {}
-        Test@Active(any) {
+        contract Test {
             entrypoint log_value(x: int) {
                 // empty body for simplicity
             }

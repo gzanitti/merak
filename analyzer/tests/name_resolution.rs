@@ -113,7 +113,7 @@ fn assert_symbol_with_kind(
         expected_qualified_name
     );
 
-    let symbol = table.get_symbol(symbol_id.unwrap());
+    let symbol = table.get_symbol(&symbol_id.unwrap());
 
     assert!(
         symbol.kind == expected_kind,
@@ -137,7 +137,7 @@ fn assert_state_var(
     let symbol_id = table.lookup(qualified_name, SymbolNamespace::Value);
     assert!(symbol_id.is_some(), "State var '{}' not found", name);
 
-    let symbol = table.get_symbol(symbol_id.unwrap());
+    let symbol = table.get_symbol(&symbol_id.unwrap());
     let has_correct_type = symbol.ty
         .as_ref()
         .map(|t| t.base == base_type)
@@ -164,7 +164,7 @@ fn assert_state_const(
     let symbol_id = table.lookup(qualified_name, SymbolNamespace::Value);
     assert!(symbol_id.is_some(), "State const '{}' not found", name);
 
-    let symbol = table.get_symbol(symbol_id.unwrap());
+    let symbol = table.get_symbol(&symbol_id.unwrap());
     let has_correct_type = symbol.ty
         .as_ref()
         .map(|t| t.base == base_type)
@@ -193,7 +193,7 @@ fn assert_entrypoint(
         qualified_name
     );
 
-    let symbol = table.get_symbol(symbol_id.unwrap());
+    let symbol = table.get_symbol(symbol_id.as_ref().expect("Impossible"));
 
     let is_entrypoint = matches!(&symbol.kind, SymbolKind::Entrypoint { .. });
 
@@ -220,7 +220,7 @@ fn assert_function(
         qualified_name
     );
 
-    let symbol = table.get_symbol(symbol_id.unwrap());
+    let symbol = table.get_symbol(symbol_id.as_ref().expect("Impossible"));
 
     let is_function = matches!(&symbol.kind, SymbolKind::Function { .. });
 
@@ -243,7 +243,7 @@ fn assert_constructor(table: &merak_symbols::SymbolTable, contract: &str) {
         contract
     );
 
-    let symbol = table.get_symbol(symbol_id.unwrap());
+    let symbol = table.get_symbol(&symbol_id.unwrap());
 
     let is_correct_constructor = matches!(&symbol.kind, SymbolKind::ContractInit { contract: c } if c == contract);
 
@@ -1614,7 +1614,7 @@ test_success_multi!(
         let symbol_id = table.lookup("Main::myVault", SymbolNamespace::Value);
         assert!(symbol_id.is_some(), "myVault state variable not found");
 
-        let symbol = table.get_symbol(symbol_id.unwrap());
+        let symbol = table.get_symbol(&symbol_id.unwrap());
         let is_valid = symbol.kind == SymbolKind::StateVar &&
             symbol.ty.as_ref().map(|t| matches!(t.base, BaseType::Contract(ref name) if name == "Vault")).unwrap_or(false);
         assert!(is_valid, "myVault should be of type Vault");
@@ -1701,7 +1701,7 @@ test_success_multi!(
         // State variable should use the alias type
         let symbol_id = table.lookup("Main::storage", SymbolNamespace::Value);
         assert!(symbol_id.is_some(), "storage state variable not found");
-        let symbol = table.get_symbol(symbol_id.unwrap());
+        let symbol = table.get_symbol(&symbol_id.unwrap());
 
         let is_valid = symbol.kind == SymbolKind::StateVar &&
             symbol.ty.as_ref().map(|t| matches!(t.base, BaseType::Contract(ref name) if name == "MyVault")).unwrap_or(false);
@@ -1796,7 +1796,7 @@ test_success_multi!(
 
         let symbol_id = table.lookup("Main::processVault::vault", SymbolNamespace::Value);
         assert!(symbol_id.is_some(), "storage state variable not found");
-        let symbol = table.get_symbol(symbol_id.unwrap());
+        let symbol = table.get_symbol(&symbol_id.unwrap());
 
         let is_valid = symbol.kind == SymbolKind::Parameter &&
             symbol.ty.as_ref().map(|t| matches!(t.base, BaseType::Contract(ref name) if name == "Vault")).unwrap_or(false);

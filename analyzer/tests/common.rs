@@ -8,7 +8,7 @@ use merak_ast::NodeIdGenerator;
 use merak_parser::parse_program;
 use merak_symbols::SymbolTable;
 
-use merak_ir::ssa_ir::{BasicBlock, BlockId, SsaCfg, SsaInstruction, SsaProgram};
+use merak_ir::ssa_ir::{BasicBlock, SsaCfg, SsaInstruction, SsaProgram};
 use merak_ir::transformers::ssa::SsaBuilder;
 
 use merak_analyzer::refinements::inference::LiquidInferenceEngine;
@@ -67,89 +67,20 @@ pub fn get_function_cfg<'a>(
         })
 }
 
-/// Helper for tests with a single function - returns the first function in a state
-pub fn get_single_function_cfg<'a>(
-    program: &'a SsaProgram,
-    contract_name: &str,
-    state_name: &str,
-) -> &'a SsaCfg {
-    let file = program
-        .files
-        .get(contract_name)
-        .unwrap_or_else(|| panic!("Contract '{}' not found", contract_name));
-
-    file.contract
-        .functions
-        .first()
-        .unwrap_or_else(|| panic!("No functions found in contract '{}'", contract_name))
-}
-
 /// Finds a block that matches a predicate
-pub fn find_block_with<F>(cfg: &SsaCfg, predicate: F) -> Option<&BasicBlock>
+pub fn find_block_with<F>(cfg: &SsaCfg, predicate: F) -> Option<&BasicBlock<SsaInstruction>>
 where
-    F: Fn(&BasicBlock) -> bool,
+    F: Fn(&BasicBlock<SsaInstruction>) -> bool,
 {
     cfg.blocks.values().find(|block| predicate(block))
 }
 
 /// Counts instructions of a specific type in a block
-pub fn count_instructions_of_type<F>(block: &BasicBlock, predicate: F) -> usize
+pub fn count_instructions_of_type<F>(block: &BasicBlock<SsaInstruction>, predicate: F) -> usize
 where
     F: Fn(&SsaInstruction) -> bool,
 {
     block.instructions.iter().filter(|i| predicate(i)).count()
-}
-
-/// Asserts that a block has exactly the expected number of predecessors
-pub fn assert_predecessors(block: &BasicBlock, expected: usize) {
-    assert_eq!(
-        block.predecessors.len(),
-        expected,
-        "Block bb{} should have {} predecessors, but has {}. Predecessors: {:?}",
-        block.id,
-        expected,
-        block.predecessors.len(),
-        block.predecessors
-    );
-}
-
-/// Asserts that a block has exactly the expected number of successors
-pub fn assert_successors(block: &BasicBlock, expected: usize) {
-    assert_eq!(
-        block.successors.len(),
-        expected,
-        "Block bb{} should have {} successors, but has {}. Successors: {:?}",
-        block.id,
-        expected,
-        block.successors.len(),
-        block.successors
-    );
-}
-
-/// Extracts all phi nodes from a block
-pub fn get_phi_nodes(block: &BasicBlock) -> Vec<&SsaInstruction> {
-    block
-        .instructions
-        .iter()
-        .filter(|i| matches!(i, SsaInstruction::Phi { .. }))
-        .collect()
-}
-
-/// Asserts that one block dominates another
-///
-/// Requires that dominance analysis has been run on the CFG
-pub fn assert_dominates(cfg: &SsaCfg, dominator: BlockId, dominated: BlockId) {
-    let dominance = cfg
-        .dominance
-        .as_ref()
-        .expect("Dominance analysis not run on CFG");
-
-    assert!(
-        dominance.dominates(dominator, dominated),
-        "Block bb{} does not dominate bb{}",
-        dominator,
-        dominated
-    );
 }
 
 pub fn load_test_contracts(
@@ -237,8 +168,50 @@ pub fn load_test_contracts_with_storage(
     Ok((ssa_program, symbol_table))
 }
 
+pub fn run_template_assignment(
+    source: &str,
+) -> Result<std::collections::HashMap<String, std::collections::HashMap<String, merak_analyzer::refinements::templates::Template>>, String> {
+    let (mut program, mut symbols) = build_ssa_with_storage(source)?;
+
+    let mut lie = LiquidInferenceEngine::new(&mut symbols);
+    let mut result = std::collections::HashMap::new();
+
+    for file in program.files.values_mut() {
+        for cfg in &mut file.contract.functions {
+            let bindings = lie
+                .assign_templates_only(cfg)
+                .map_err(|e| format!("Template assignment error: {:?}", e))?;
+            result.insert(cfg.name.clone(), bindings);
+        }
+    }
+
+    Ok(result)
+}
+
+pub fn run_constraint_generation(
+    source: &str,
+) -> Result<std::collections::HashMap<String, merak_analyzer::refinements::constraints::ConstraintSet>, String> {
+    let (mut program, mut symbols) = build_ssa_with_storage(source)?;
+
+    let mut lie = LiquidInferenceEngine::new(&mut symbols);
+    let mut result = std::collections::HashMap::new();
+
+    for file in program.files.values_mut() {
+        for cfg in &mut file.contract.functions {
+            let constraints = lie
+                .generate_constraints_only(cfg)
+                .map_err(|e| format!("Constraint generation error: {:?}", e))?;
+            result.insert(cfg.name.clone(), constraints);
+        }
+    }
+
+    Ok(result)
+}
+
 pub fn run_refinement_inference(source: &str) -> Result<(SsaProgram, SymbolTable), String> {
     let (mut program, mut symbols) = build_ssa_with_storage(source)?;
+
+    println!("SSA P: {:?}", program);
 
     let mut lie = LiquidInferenceEngine::new(&mut symbols);
     for file in program.files.values_mut() {

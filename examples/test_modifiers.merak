@@ -1,14 +1,12 @@
 // Test file para validar los nuevos modificadores
 
-contract TestModifiers[Active] {
+contract TestModifiers {
     state var balance: int = 0;
 
     constructor() {
         balance = 0;
     }
-}
 
-TestModifiers@Active(any) {
     // Test 1: external function con payable - válido
     external function deposit() payable {
         balance = balance + 100;

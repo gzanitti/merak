@@ -10,10 +10,12 @@ pub type LoopId = usize;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
+use crate::ControlFlowGraph;
+
 use indexmap::IndexMap;
 use merak_ast::contract::InterfaceDecl;
 use merak_ast::predicate::{Predicate, RefinementExpr};
-use merak_ast::types::{BaseType, Type};
+use merak_ast::types::{BaseType};
 use merak_ast::{
     expression::{BinaryOperator, Expression, UnaryOperator},
     meta::SourceRef,
@@ -24,23 +26,69 @@ use merak_symbols::SymbolId;
 use primitive_types::H256;
 
 /// Operand of an instruction (input value)
+/// Generic operand - can hold either a location (Register or StackSlot) or a constant
 #[derive(Debug, Clone)]
-pub enum Operand {
-    Register(Register),
+pub enum Operand<Loc> {
+    Location(Loc),
     Constant(Constant),
 }
 
-impl Operand {
-    pub fn symbol_id(&self) -> Option<SymbolId> {
+/// Type alias for SSA operands (with Registers)
+pub type SsaOperand = Operand<Register>;
+
+// Generic implementations
+impl<Loc> Operand<Loc> {
+    pub fn constant(c: Constant) -> Self {
+        Operand::Constant(c)
+    }
+
+    pub fn location(loc: Loc) -> Self {
+        Operand::Location(loc)
+    }
+
+    pub fn is_constant(&self) -> bool {
+        matches!(self, Operand::Constant(_))
+    }
+}
+
+impl<Loc: Clone> Operand<Loc> {
+    /// Map the location type (for lowering transformations)
+    pub fn map_location<T>(self, f: impl FnOnce(Loc) -> T) -> Operand<T> {
         match self {
-            Operand::Register(r) => Some(r.symbol),
-            Operand::Constant(_) => None,
+            Operand::Location(loc) => Operand::Location(f(loc)),
+            Operand::Constant(c) => Operand::Constant(c),
+        }
+    }
+
+    /// Try to map the location type with fallible operation
+    pub fn try_map_location<T, E>(
+        self,
+        f: impl FnOnce(Loc) -> Result<T, E>,
+    ) -> Result<Operand<T>, E> {
+        match self {
+            Operand::Location(loc) => f(loc).map(Operand::Location),
+            Operand::Constant(c) => Ok(Operand::Constant(c)),
         }
     }
 }
 
+// SSA-specific implementation (only when Loc = Register)
+impl Operand<Register> {
+    pub fn symbol_id(&self) -> Option<SymbolId> {
+        match self {
+            Operand::Location(r) => Some(r.symbol.clone()),
+            Operand::Constant(_) => None,
+        }
+    }
+
+    // Backwards compatibility: keep old names as constructors
+    pub fn register(r: Register) -> Self {
+        Operand::Location(r)
+    }
+}
+
 /// SSA-versioned register
-#[derive(Debug, Clone, Copy, Hash, Eq, PartialEq)]
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct Register {
     pub symbol: SymbolId, // Links to symbol table entry
     pub version: usize,   // SSA version: x₀, x₁, x₂, ...
@@ -48,7 +96,7 @@ pub struct Register {
 
 impl std::fmt::Display for Register {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "r{}_{}", self.symbol, self.version)
+        write!(f, "{}_{}", self.symbol, self.version)
     }
 }
 
@@ -64,6 +112,70 @@ pub enum Constant {
 // SSA INSTRUCTIONS
 // ============================================================================
 
+/// Common instruction interface for both SSA and Lowered IR
+///
+/// This trait provides a uniform API for working with instructions,
+/// enabling generic algorithms (liveness analysis, dead code elimination, etc.)
+/// to work across both IRs.
+///
+/// # Example: Generic Dead Code Detection
+///
+/// ```ignore
+/// fn has_dead_code<I: Instruction>(instructions: &[I]) -> bool {
+///     instructions.iter().any(|inst| {
+///         // Instruction with destination but no side effects might be dead code
+///         inst.destination().is_some() && !inst.has_side_effects()
+///     })
+/// }
+///
+/// // Works for both SSA and Lowered IR!
+/// let ssa_has_dead = has_dead_code(&ssa_block.instructions);
+/// let lowered_has_dead = has_dead_code(&lowered_block.instructions);
+/// ```
+///
+/// # Example: Generic Operand Renaming
+///
+/// ```ignore
+/// fn rename_operand<I, F>(instruction: &mut I, f: F)
+/// where
+///     I: Instruction,
+///     F: Fn(&mut I::Operand),
+/// {
+///     for operand in instruction.operands_mut() {
+///         f(operand);
+///     }
+/// }
+/// ```
+pub trait Instruction: Sized {
+    /// The operand type (SsaOperand or LoweredOperand)
+    type Operand;
+
+    /// The destination type (Register or StackSlot)
+    type Destination: Clone;
+
+    /// Get destination register/slot if this instruction produces a value
+    fn destination(&self) -> Option<Self::Destination>;
+
+    /// Get all input operands (for analysis)
+    fn operands(&self) -> Vec<&Self::Operand>;
+
+    /// Get all input operands (mutable, for transformations like renaming)
+    fn operands_mut(&mut self) -> Vec<&mut Self::Operand>;
+
+    /// Is this a verification-only instruction that doesn't generate code?
+    ///
+    /// Verification-only instructions (Phi, Unfold, Fold, Assert) are used
+    /// for analysis and verification but don't produce runtime code.
+    fn is_verification_only(&self) -> bool {
+        false
+    }
+
+    /// Does this instruction have side effects (storage writes, calls)?
+    fn has_side_effects(&self) -> bool {
+        false
+    }
+}
+
 #[derive(Clone)]
 pub enum SsaInstruction {
     // ------------------------------------------------------------------------
@@ -72,7 +184,7 @@ pub enum SsaInstruction {
     /// Simple copy: dest = source
     Copy {
         dest: Register,
-        source: Operand,
+        source: SsaOperand,
         source_ref: SourceRef,
     },
 
@@ -91,8 +203,8 @@ pub enum SsaInstruction {
     BinaryOp {
         dest: Register,
         op: BinaryOperator,
-        left: Operand,
-        right: Operand,
+        left: SsaOperand,
+        right: SsaOperand,
         source_ref: SourceRef,
     },
 
@@ -100,7 +212,7 @@ pub enum SsaInstruction {
     UnaryOp {
         dest: Register,
         op: UnaryOperator,
-        operand: Operand,
+        operand: SsaOperand,
         source_ref: SourceRef,
     },
 
@@ -118,7 +230,7 @@ pub enum SsaInstruction {
     /// Writes to a state variable
     StorageStore {
         var: SymbolId,
-        value: Operand,
+        value: SsaOperand,
         source_ref: SourceRef,
     },
 
@@ -129,7 +241,7 @@ pub enum SsaInstruction {
     Call {
         dest: Option<Register>, // None if function is void
         target: CallTarget,
-        args: Vec<Operand>,
+        args: Vec<SsaOperand>,
         source_ref: SourceRef,
     },
 
@@ -161,7 +273,7 @@ pub enum SsaInstruction {
     /// - Postcondition: must be proven at exit (callee guarantees)
     /// - UserAssert: explicit assertion in code
     Assert {
-        condition: Operand,
+        condition: SsaOperand,
         kind: AssertKind,
         source_ref: SourceRef,
     },
@@ -202,7 +314,7 @@ pub enum SsaInstruction {
     // MemoryStore {
     //     base: Register,
     //     offset: Operand,
-    //     value: Operand,
+    //     value: SsaOperand,
     //     source_ref: SourceRef,
     // },
 }
@@ -214,14 +326,75 @@ impl SsaInstruction {
             | SsaInstruction::Phi { dest, .. }
             | SsaInstruction::BinaryOp { dest, .. }
             | SsaInstruction::UnaryOp { dest, .. }
-            | SsaInstruction::StorageLoad { dest, .. } => Some(*dest),
+            | SsaInstruction::StorageLoad { dest, .. } => Some(dest.clone()),
 
-            SsaInstruction::Call { dest, .. } => *dest,
+            SsaInstruction::Call { dest, .. } => dest.clone(),
 
             SsaInstruction::StorageStore { .. }
             | SsaInstruction::Fold { .. } | SsaInstruction::Unfold { .. }
             | SsaInstruction::Assert { .. } => None,
         }
+    }
+}
+
+/// Instruction trait implementation for SSA IR
+impl Instruction for SsaInstruction {
+    type Operand = SsaOperand;
+    type Destination = Register;
+
+    fn destination(&self) -> Option<Self::Destination> {
+        self.dest_register()
+    }
+
+    fn operands(&self) -> Vec<&Self::Operand> {
+        match self {
+            SsaInstruction::Copy { source, .. } => vec![source],
+            SsaInstruction::BinaryOp { left, right, .. } => vec![left, right],
+            SsaInstruction::UnaryOp { operand, .. } => vec![operand],
+            SsaInstruction::StorageStore { value, .. } => vec![value],
+            SsaInstruction::Call { args, .. } => args.iter().collect(),
+            SsaInstruction::Assert { condition, .. } => vec![condition],
+            // Phi nodes use Register references, not Operands
+            SsaInstruction::Phi { .. } => vec![],
+            // No operands
+            SsaInstruction::StorageLoad { .. }
+            | SsaInstruction::Unfold { .. }
+            | SsaInstruction::Fold { .. } => vec![],
+        }
+    }
+
+    fn operands_mut(&mut self) -> Vec<&mut Self::Operand> {
+        match self {
+            SsaInstruction::Copy { source, .. } => vec![source],
+            SsaInstruction::BinaryOp { left, right, .. } => vec![left, right],
+            SsaInstruction::UnaryOp { operand, .. } => vec![operand],
+            SsaInstruction::StorageStore { value, .. } => vec![value],
+            SsaInstruction::Call { args, .. } => args.iter_mut().collect(),
+            SsaInstruction::Assert { condition, .. } => vec![condition],
+            // Phi nodes use Register references, not Operands
+            SsaInstruction::Phi { .. } => vec![],
+            // No operands
+            SsaInstruction::StorageLoad { .. }
+            | SsaInstruction::Unfold { .. }
+            | SsaInstruction::Fold { .. } => vec![],
+        }
+    }
+
+    fn is_verification_only(&self) -> bool {
+        matches!(
+            self,
+            SsaInstruction::Phi { .. }
+                | SsaInstruction::Unfold { .. }
+                | SsaInstruction::Fold { .. }
+                | SsaInstruction::Assert { .. }
+        )
+    }
+
+    fn has_side_effects(&self) -> bool {
+        matches!(
+            self,
+            SsaInstruction::StorageStore { .. } | SsaInstruction::Call { .. }
+        )
     }
 }
 
@@ -236,7 +409,7 @@ pub enum CallTarget {
 
     /// Function in an imported contract
     External {
-        object: Operand,          
+        object: SsaOperand,
         method: SymbolId,          // La función específica en esa interface/contrato
     },
 }
@@ -286,53 +459,156 @@ pub enum AssertKind {
 // ============================================================================
 
 /// Terminator instruction - exactly one per basic block
+/// Metadata for SSA terminators (verification info)
+#[derive(Debug, Clone, Default)]
+pub struct TerminatorMeta {
+    pub source_ref: SourceRef,
+    pub loop_invariants: Vec<Predicate>,
+    pub loop_variants: Vec<RefinementExpr>,
+}
+
+/// Generic terminator instruction
+/// - O: Operand type (SsaOperand or LoweredOperand)
+/// - M: Metadata type (TerminatorMeta or ())
 #[derive(Debug, Clone)]
-pub enum Terminator {
+pub enum Terminator<O = SsaOperand, M = TerminatorMeta> {
     /// Unconditional jump: goto target
     Jump { target: BlockId },
 
     /// Conditional branch: if condition then goto then_block else goto else_block
     Branch {
-        condition: Operand,
+        condition: O,
         then_block: BlockId,
         else_block: BlockId,
-        invariants: Vec<Predicate>, // empty for ifs, >= 1 for loops
-        variants: Vec<RefinementExpr>, // empty for ifs, >= 1 for loops
-        source_ref: SourceRef,
+        meta: M,
     },
 
     /// Return from function
     Return {
-        value: Option<Operand>, // None for void functions
-        source_ref: SourceRef,
+        value: Option<O>,
+        meta: M,
     },
 
     /// Unreachable code (for dead code analysis)
     Unreachable,
 }
 
+/// Type alias for SSA terminators (with full metadata)
+pub type SsaTerminator = Terminator<SsaOperand, TerminatorMeta>;
+
+// Generic implementations
+impl<O, M> Terminator<O, M> {
+    /// Get all successor blocks
+    pub fn successors(&self) -> Vec<BlockId> {
+        match self {
+            Terminator::Jump { target } => vec![*target],
+            Terminator::Branch { then_block, else_block, .. } => {
+                vec![*then_block, *else_block]
+            }
+            Terminator::Return { .. } | Terminator::Unreachable => vec![],
+        }
+    }
+
+    /// Get all operands (mutable access for renaming)
+    pub fn operands_mut(&mut self) -> Vec<&mut O> {
+        match self {
+            Terminator::Branch { condition, .. } => vec![condition],
+            Terminator::Return { value: Some(v), .. } => vec![v],
+            _ => vec![],
+        }
+    }
+}
+
+impl<O: Clone, M> Terminator<O, M> {
+    /// Transform to different operand type (for lowering)
+    pub fn map_operand<T, F>(self, mut f: F) -> Terminator<T, M>
+    where
+        F: FnMut(O) -> T,
+    {
+        match self {
+            Terminator::Jump { target } => Terminator::Jump { target },
+            Terminator::Branch { condition, then_block, else_block, meta } => {
+                Terminator::Branch {
+                    condition: f(condition),
+                    then_block,
+                    else_block,
+                    meta,
+                }
+            }
+            Terminator::Return { value, meta } => Terminator::Return {
+                value: value.map(f),
+                meta,
+            },
+            Terminator::Unreachable => Terminator::Unreachable,
+        }
+    }
+}
+
+impl<O> Terminator<O, TerminatorMeta> {
+    /// Strip metadata (SSA -> Lowered transition)
+    pub fn strip_metadata(self) -> Terminator<O, ()> {
+        match self {
+            Terminator::Jump { target } => Terminator::Jump { target },
+            Terminator::Branch { condition, then_block, else_block, .. } => {
+                Terminator::Branch {
+                    condition,
+                    then_block,
+                    else_block,
+                    meta: (),
+                }
+            }
+            Terminator::Return { value, .. } => Terminator::Return {
+                value,
+                meta: (),
+            },
+            Terminator::Unreachable => Terminator::Unreachable,
+        }
+    }
+}
+
+/// Default implementation for Terminator (creates Unreachable)
+impl<O, M> Default for Terminator<O, M> {
+    fn default() -> Self {
+        Terminator::Unreachable
+    }
+}
+
 // ============================================================================
 // BASIC BLOCK
 // ============================================================================
 
-pub struct BasicBlock {
+/// Generic basic block structure for both SSA and Lowered IR
+///
+/// Type parameters:
+/// - `I`: Instruction type (SsaInstruction or LoweredInstruction)
+/// - `T`: Terminator type (SsaTerminator or LoweredTerminator), defaults to SsaTerminator
+#[derive(Clone)]
+pub struct BasicBlock<I, T = SsaTerminator> {
     pub id: BlockId,
-
-    /// Sequential instructions (no control flow)
-    pub instructions: Vec<SsaInstruction>,
-
-    /// Control flow
-    pub terminator: Terminator,
-
-    // Metadata for analysis and traversal
+    pub instructions: Vec<I>,
+    pub terminator: T,
     pub predecessors: Vec<BlockId>,
     pub successors: Vec<BlockId>,
-
-    // Metada for loop checking
-    // Lives here to avoid duplicate information
     pub loop_invariants: Option<Vec<Predicate>>,
     pub loop_variants: Option<Vec<RefinementExpr>>,
 }
+
+impl<I, T: Default> BasicBlock<I, T> {
+    pub fn new(id: BlockId) -> Self {
+        Self {
+            id,
+            instructions: Vec::new(),
+            terminator: T::default(),
+            predecessors: Vec::new(),
+            successors: Vec::new(),
+            loop_invariants: None,
+            loop_variants: None,
+        }
+    }
+}
+
+/// Type alias for SSA basic blocks
+pub type SsaBlock = BasicBlock<SsaInstruction, SsaTerminator>;
 
 // ============================================================================
 // CFG
@@ -341,7 +617,7 @@ pub struct BasicBlock {
 pub struct SsaCfg {
     pub name: String,
     pub function_id: SymbolId,
-    pub blocks: HashMap<BlockId, BasicBlock>,
+    pub blocks: HashMap<BlockId, BasicBlock<SsaInstruction>>,
     pub entry: BlockId,
     pub next_id: usize,
 
@@ -361,7 +637,7 @@ pub struct SsaCfg {
     /// Loop information (computed after dominance analysis)
     pub loops: Option<LoopForest>,
 
-    pub local_temps: HashMap<Register, BaseType>,
+    pub local_temps: HashMap<SymbolId, BaseType>,
 
     /// Cached reverse post-order traversal
     rpo_cache: OnceLock<Vec<BlockId>>,
@@ -445,40 +721,24 @@ impl SsaCfg {
         }
     }
 
-    pub fn add_param(&mut self, param: SymbolId) {
-        self.parameters.push(param);
+    pub fn add_param(&mut self, id: SymbolId) {
+        self.parameters.push(id);
     }
 
     pub fn exit_blocks(&self) -> Vec<BlockId> {
         self.blocks.keys().copied().filter(|id| matches!(self.blocks[id].terminator, Terminator::Return{..})).collect()
     }
 
+    /// Cached reverse postorder — prefer this over the trait method inside
+    /// this module to avoid recomputing on every call to `compute_dominance`.
     pub fn reverse_post_order(&self) -> &Vec<BlockId> {
         self.rpo_cache.get_or_init(|| {
             let mut visited = HashSet::new();
-            let mut post_order = Vec::new();
-
-            self.post_order_dfs(self.entry, &mut visited, &mut post_order);
-
-            post_order.reverse();
-            post_order
+            let mut postorder = Vec::new();
+            self.postorder_dfs(self.entry, &mut visited, &mut postorder);
+            postorder.reverse();
+            postorder
         })
-    }
-
-    fn post_order_dfs(
-        &self,
-        block_id: usize,
-        visited: &mut HashSet<BlockId>,
-        post_order: &mut Vec<BlockId>,
-    ) {
-        if !visited.contains(&block_id) {
-            visited.insert(block_id);
-            let successors: Vec<_> = self.blocks[&block_id].successors.iter().copied().collect();
-            for succ in successors {
-                self.post_order_dfs(succ, visited, post_order);
-            }
-            post_order.push(block_id);
-        }
     }
 
     pub fn compute_dominance(&mut self) {
@@ -777,9 +1037,9 @@ impl SsaCfg {
     fn def_sites(&self) -> HashMap<SymbolId, Vec<BlockId>> {
         let mut def_sites = HashMap::new();
 
-        for &param in &self.parameters {
+        for param in &self.parameters {
             def_sites
-                .entry(param)
+                .entry(param.clone())
                 .or_insert_with(Vec::new)
                 .push(self.entry);
         }
@@ -789,26 +1049,26 @@ impl SsaCfg {
                 match inst {
                     SsaInstruction::Copy { dest, .. } => {
                         def_sites
-                            .entry(dest.symbol)
+                            .entry(dest.symbol.clone())
                             .or_insert_with(Vec::new)
                             .push(*block_id);
                     }
                     SsaInstruction::Phi { .. } => {}
                     SsaInstruction::BinaryOp { dest, .. } => {
                         def_sites
-                            .entry(dest.symbol)
+                            .entry(dest.symbol.clone())
                             .or_insert_with(Vec::new)
                             .push(*block_id);
                     }
                     SsaInstruction::UnaryOp { dest, .. } => {
                         def_sites
-                            .entry(dest.symbol)
+                            .entry(dest.symbol.clone())
                             .or_insert_with(Vec::new)
                             .push(*block_id);
                     }
                     SsaInstruction::StorageLoad { dest, .. } => {
                         def_sites
-                            .entry(dest.symbol)
+                            .entry(dest.symbol.clone())
                             .or_insert_with(Vec::new)
                             .push(*block_id);
                     }
@@ -816,7 +1076,7 @@ impl SsaCfg {
                     SsaInstruction::Call { dest, .. } => {
                         if let Some(d) = dest {
                             def_sites
-                                .entry(d.symbol)
+                                .entry(d.symbol.clone())
                                 .or_insert_with(Vec::new)
                                 .push(*block_id);
                         }
@@ -835,10 +1095,8 @@ impl SsaCfg {
     }
 
     fn phi_nodes_placement(&mut self) {
-        let def_sites = self.def_sites();
-
-        for (symbol, sites) in &def_sites {
-            self.place_phis_for_variable(*symbol, sites);
+        for (symbol, sites) in self.def_sites() {
+            self.place_phis_for_variable(symbol, &sites);
         }
     }
 
@@ -858,7 +1116,7 @@ impl SsaCfg {
                         .insert(
                             0,
                             SsaInstruction::Phi {
-                                dest: Register { symbol, version: 0 },
+                                dest: Register { symbol: symbol.clone(), version: 0 },
                                 sources: vec![],
                             },
                         );
@@ -880,8 +1138,8 @@ impl SsaCfg {
         let mut ctx = RenamingContext::new();
 
         for param in &self.parameters {
-            let version = ctx.next_version(*param);
-            ctx.push(*param, version);
+            let version = ctx.next_version(param.clone());
+            ctx.push(param.clone(), version);
         }
 
         self.recursive_rename_blocks(self.entry, &mut ctx);
@@ -931,13 +1189,13 @@ impl SsaCfg {
 
         for idx in phi_indices {
             if let SsaInstruction::Phi { dest, .. } = &mut block.instructions[idx] {
-                let symbol = dest.symbol;
+                let symbol = &dest.symbol;
 
-                let version = ctx.next_version(symbol);
+                let version = ctx.next_version(symbol.clone());
                 dest.version = version;
 
-                ctx.push(symbol, version);
-                definitions_made.push((symbol, version));
+                ctx.push(symbol.clone(), version);
+                definitions_made.push((symbol.clone(), version));
             }
         }
     }
@@ -963,21 +1221,21 @@ impl SsaCfg {
                 | SsaInstruction::BinaryOp { dest, .. }
                 | SsaInstruction::UnaryOp { dest, .. }
                 | SsaInstruction::StorageLoad { dest, .. } => {
-                    let symbol = dest.symbol;
-                    let version = ctx.next_version(symbol);
+                    let symbol = &dest.symbol;
+                    let version = ctx.next_version(symbol.clone());
                     dest.version = version;
 
-                    ctx.push(symbol, version);
-                    definitions_made.push((symbol, version));
+                    ctx.push(symbol.clone(), version);
+                    definitions_made.push((symbol.clone(), version));
                 }
                 SsaInstruction::Call { dest, .. } => {
                     if let Some(d) = dest.as_mut() {
-                        let symbol = d.symbol;
-                        let version = ctx.next_version(symbol);
+                        let symbol = &d.symbol;
+                        let version = ctx.next_version(symbol.clone());
                         d.version = version;
 
-                        ctx.push(symbol, version);
-                        definitions_made.push((symbol, version));
+                        ctx.push(symbol.clone(), version);
+                        definitions_made.push((symbol.clone(), version));
                     }
                 }
                 SsaInstruction::Phi { .. }
@@ -1025,10 +1283,10 @@ impl SsaCfg {
     }
 
     /// Rename a single operand to its current version
-    fn rename_operand(operand: &mut Operand, ctx: &RenamingContext) {
-        if let Operand::Register(reg) = operand {
+    fn rename_operand(operand: &mut SsaOperand, ctx: &RenamingContext) {
+        if let Operand::Location(reg) = operand {
             let version = ctx
-                .top(reg.symbol)
+                .top(reg.symbol.clone())
                 .expect(&format!("Variable {:?} used before definition", reg.symbol));
             reg.version = version;
         }
@@ -1065,9 +1323,9 @@ impl SsaCfg {
 
             for inst in &mut succ_block.instructions {
                 if let SsaInstruction::Phi { dest, sources, .. } = inst {
-                    let symbol = dest.symbol;
+                    let symbol = dest.symbol.clone();
 
-                    if let Some(version) = ctx.top(symbol) {
+                    if let Some(version) = ctx.top(symbol.clone()) {
                         sources.push((block_id, Register { symbol, version }));
                     }
                 }
@@ -1220,7 +1478,7 @@ impl std::fmt::Debug for SsaInstruction {
                 if let Some(d) = dest {
                     write!(f, "{:?} = ", d)?;
                 }
-                write!(f, "{:?}(", target)?;
+                write!(f, "Call {:?}(", target)?;
                 for (i, arg) in args.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
@@ -1244,7 +1502,7 @@ impl std::fmt::Debug for SsaInstruction {
     }
 }
 
-impl std::fmt::Debug for BasicBlock {
+impl<I: std::fmt::Debug, T: std::fmt::Debug> std::fmt::Debug for BasicBlock<I, T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         writeln!(f, "bb{}: {{", self.id)?;
 
@@ -1281,6 +1539,29 @@ impl std::fmt::Debug for BasicBlock {
         }
 
         write!(f, "}}")
+    }
+}
+
+impl ControlFlowGraph for SsaCfg {
+    fn entry(&self) -> BlockId {
+        self.entry
+    }
+
+    fn successors(&self, block: BlockId) -> Vec<BlockId> {
+        self.blocks[&block].successors.clone()
+    }
+
+    fn predecessors(&self, block: BlockId) -> Vec<BlockId> {
+        self.blocks[&block].predecessors.clone()
+    }
+
+    fn block_ids(&self) -> Vec<BlockId> {
+        self.blocks.keys().copied().collect()
+    }
+
+    /// Override the default to reuse the `OnceLock` cache.
+    fn reverse_post_order(&self) -> Vec<BlockId> {
+        SsaCfg::reverse_post_order(self).clone()
     }
 }
 
