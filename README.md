@@ -2,7 +2,7 @@
 
 A language for Ethereum smart contracts that combines liquid types with explicit specifications to provide compile-time safety guarantees with minimal runtime overhead. Merak is a research project exploring the intersection of formal verification, type theory, and blockchain security. It represents a long-term vision for how smart contracts should be written: with mathematical certainty of correctness built into the development process itself.
 
-> ⚠️ **Development Status & Stability Notice**: Merak is an experimental research language under active development. While the core architecture is taking shape, the compiler produce unverified/unsecure bytecode. The language semantics, type system, and compiler architecture are expected to evolve significantly, and future releases may introduce **breaking changes** without backward compatibility guarantees. While Merak currently plans to target the Ethereum Virtual Machine (EVM), alternative compilation targets and execution models are under consideration, and the intended target platform may change as the project matures.
+> ⚠️ **Development Status & Stability Notice**: Merak is an experimental research language under active development. While the core architecture is taking shape, the compiler produces unverified/unsecure bytecode. The language semantics, type system, and compiler architecture are expected to evolve significantly, and future releases may introduce **breaking changes** without backward compatibility guarantees. Merak targets the Ethereum Virtual Machine (EVM) and is designed around its execution model. The current bytecode emitter is expected to be replaced by [evmlir](https://github.com/gzanitti/evmlir), an MLIR-based EVM backend currently under active development.
 
 
 ## Overview
