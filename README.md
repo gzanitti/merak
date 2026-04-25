@@ -133,8 +133,8 @@ AST
 
 Merak is an ambitious long-term project. While it's not ready for production use, I believe formal verification is essential for blockchain's future. At this time, we are not accepting pull requests, but you can support the project via donations:
 
-**Ethereum Donation Address**: `0x7ff4408bf503cdd3991771a18e8f8c364eace215`
-**Giveth**: https://giveth.io/project/merak
+- **Ethereum Donation Address**: `0x7ff4408bf503cdd3991771a18e8f8c364eace215`
+- **Giveth**: https://giveth.io/project/merak
 
 Donations will go toward:
 - Development time and research
